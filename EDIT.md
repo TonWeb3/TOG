@@ -86,3 +86,29 @@ This document details all modifications made to the codebase to port requested f
 - Trade eligibility is scoped per `market_id`.
 - If an older trade from the previous window is still waiting for Polymarket's authoritative resolution (e.g., during the 90s grace period), the bot does NOT block entries for the new window.
 - As soon as the new market opens and an EV edge appears, the bot enters immediately.
+
+---
+
+## Post-Launch Frontend Fixes (Session 2)
+
+### 7. WebSocket `applySnapshot` Deserialization Fix — `templates/index.html`
+- **Root cause**: The WS endpoint sends a wrapped frame `{type, data, logs, log_seq, redeemable, redeem_run}` but the original `applySnapshot()` was doing `this.data = frame` instead of `this.data = frame.data`, meaning every `data.trading_state`, `data.prices`, etc. binding was looking at the wrapper and returning `undefined`.
+- **Fix**: `applySnapshot(frame)` now detects the `type === 'state_update'` wrapper and correctly unpacks `frame.data` as the live state. Logs, redeemable, and run status are also merged in-place without needing a full page refresh.
+- **Fallback**: REST `/api/latest` returns the inner dict directly so the same function works for both paths without special casing.
+
+### 8. `'NaN'` → `'--'` Placeholder Fix — `templates/index.html`
+- All indicator and prediction `x-text` expressions previously showed the string `'NaN'` when data was not yet available (bot stopped or first load).
+- Replaced all 6 occurrences with `'--'` for a cleaner, more professional idle state display.
+
+### 9. Book WS Source Indicator — `main.py`
+- Added `book_source` field (`"ws"` | `"rest"`) to `fetch_polymarket_snapshot()` return value.
+- Propagated into `latest_data.prices.book_source` so the header **Book WS** indicator dot correctly shows:
+  - 🟢 Green when the CLOB WS stream is providing live bids/asks
+  - 🟡 Amber when REST polling is the fallback
+  - 🔴 Red when no book data is available at all
+
+### Files Touched in Session 2
+| File | Change |
+|---|---|
+| `templates/index.html` | Fixed `applySnapshot` WS frame unpacking; `'NaN'` → `'--'` in 6 expressions |
+| `main.py` | Added `book_source` to `fetch_polymarket_snapshot()` and `latest_data.prices` |

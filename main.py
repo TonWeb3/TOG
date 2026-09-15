@@ -380,6 +380,9 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
             if not down_book_summary:
                 down_book_summary = {"bestBid": None, "bestAsk": down_buy, "spread": None, "bidLiquidity": None, "askLiquidity": None}
 
+    # Track whether the book data came from WS or REST
+    book_source = "ws" if ((up_ws.get("bids") or up_ws.get("asks")) and (down_ws.get("bids") or down_ws.get("asks"))) else "rest"
+
     return {
         "ok": True,
         "market": market,
@@ -394,7 +397,8 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
         "orderbook": {
             "up": up_book_summary,
             "down": down_book_summary
-        }
+        },
+        "book_source": book_source
     }
 
 async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any], market: Dict[str, Any], strike_open: Optional[float], token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None,
@@ -1313,7 +1317,8 @@ async def update_loop():
                     "window_open_source": strike_source,
                     "model_open": model_open,
                     "window_start_ms": start_ms,
-                    "price_is_fresh": price_is_fresh
+                    "price_is_fresh": price_is_fresh,
+                    "book_source": poly_snapshot.get("book_source") if poly_snapshot.get("ok") else None
                 },
                 "indicators": {
                     "rsi": rsi_now,
