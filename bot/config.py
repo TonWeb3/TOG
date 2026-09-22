@@ -188,9 +188,10 @@ def load_settings():
                 ce = config_data["capital_extractor"]
                 if "enabled" in ce: base_settings.AUTO_WITHDRAW_ENABLED = bool(ce["enabled"])
                 if "trigger_balance" in ce: base_settings.WITHDRAW_TRIGGER_BALANCE = float(ce["trigger_balance"])
-                if "withdraw_amount" in ce: base_settings.WITHDRAW_AMOUNT = float(ce["withdraw_amount"])
-                if "recipient_address" in ce: base_settings.WITHDRAW_ADDRESS = str(ce["recipient_address"]).strip()
-                if "auto_resume" in ce: base_settings.WITHDRAW_AUTO_RESUME = bool(ce["auto_resume"])
+                addr = ce.get("withdraw_address") if "withdraw_address" in ce else ce.get("recipient_address")
+                if addr is not None: base_settings.WITHDRAW_ADDRESS = str(addr).strip()
+                auto_res = ce.get("auto_resume_after_withdrawal") if "auto_resume_after_withdrawal" in ce else ce.get("auto_resume")
+                if auto_res is not None: base_settings.WITHDRAW_AUTO_RESUME = bool(auto_res)
                 if "resume_after" in ce: base_settings.WITHDRAW_RESUME_AFTER = str(ce["resume_after"]).strip()
 
             if "telegram" in config_data:

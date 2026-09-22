@@ -43,10 +43,6 @@ def _wake_entry(data_payload=None):
     _market_event.set()
 
 # ── Redemption state ──────────────────────────────────────────────────────────
-REDEEM_CHECK_INTERVAL_S = 60
-REDEEM_SUBMITTED_HIDE_S = 15 * 60
-_redeem_wake = asyncio.Event()
-_redeem_lock = asyncio.Lock()
 
 # ── Global state ───────────────────────────────────────────────────────────────
 state = {
@@ -77,9 +73,6 @@ state = {
     "trade_ctx": None,
     "event_exec": None,
     # Redeem tracking
-    "redeemable": {"positions": [], "count": 0, "value": 0.0, "checked_at": None, "error": None},
-    "redeem_run": {"busy": False, "total": 0, "done": 0, "ok": 0, "failed": 0, "errors": [], "value": 0.0, "finished_at": None},
-    "redeem_submitted": {},
 }
 
 def log_message(msg: str):
@@ -99,7 +92,6 @@ def save_state():
             "trade_history": state["trade_history"],
             "last_trade_side": state["last_trade_side"],
             "last_withdrawal": state.get("last_withdrawal"),
-            "redeem_submitted": state.get("redeem_submitted", {})
         }
         with open(STATE_PATH, "w") as f:
             json.dump(data_to_save, f, indent=2)
@@ -125,7 +117,6 @@ def load_state():
                 state["trade_history"] = loaded.get("trade_history", [])
                 state["last_trade_side"] = loaded.get("last_trade_side")
                 state["last_withdrawal"] = loaded.get("last_withdrawal")
-                state["redeem_submitted"] = loaded.get("redeem_submitted", {})
                 log_message(f"State loaded from {STATE_PATH}")
     except Exception as e:
         print(f"Error loading state: {e}")
@@ -241,8 +232,6 @@ async def broadcast_state():
         "data": state["latest_data"],
         "logs": state["logs"][-20:],
         "log_seq": state["log_seq"],
-        "redeemable": state["redeemable"],
-        "redeem_run": state["redeem_run"],
     })
     dead = set()
     for ws in list(_ws_clients):
@@ -287,20 +276,52 @@ def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
         "remainingMinutes": remaining_ms / 60_000
     }
 
-async def fetch_polymarket_snapshot() -> Dict[str, Any]:
+_cached_market = None
+_cached_market_ts = 0.0
+_cached_market_series = ""
+
+async def get_active_market(force: bool = False) -> Optional[Dict[str, Any]]:
+    global _cached_market, _cached_market_ts, _cached_market_series
+    now = time.time()
+    curr_target = settings.POLYMARKET_SLUG or settings.POLYMARKET_SERIES_ID
+    if not force and _cached_market and _cached_market_series == curr_target:
+        end_date = _cached_market.get("endDate")
+        if end_date:
+            try:
+                end_ts = datetime.fromisoformat(end_date.replace('Z', '+00:00')).timestamp()
+                if end_ts > now + 15 and (now - _cached_market_ts) < 30.0:
+                    return _cached_market
+            except Exception:
+                pass
+        elif (now - _cached_market_ts) < 30.0:
+            return _cached_market
+
     market = None
-    if settings.POLYMARKET_SLUG:
-        market = await data.fetch_market_by_slug(settings.POLYMARKET_SLUG)
-    elif settings.POLYMARKET_AUTO_SELECT_LATEST:
-        events = await data.fetch_live_events_by_series_id(settings.POLYMARKET_SERIES_ID)
-        markets = data.flatten_event_markets(events)
+    try:
+        if settings.POLYMARKET_SLUG:
+            market = await data.fetch_market_by_slug(settings.POLYMARKET_SLUG)
+        elif settings.POLYMARKET_AUTO_SELECT_LATEST:
+            events = await data.fetch_live_events_by_series_id(settings.POLYMARKET_SERIES_ID)
+            markets = data.flatten_event_markets(events)
+            now_ms = now * 1000
+            live_markets = [
+                m for m in markets
+                if m.get("endDate") and datetime.fromisoformat(m["endDate"].replace('Z', '+00:00')).timestamp() * 1000 > now_ms
+            ]
+            if live_markets:
+                live_markets.sort(key=lambda x: x["endDate"])
+                market = live_markets[0]
+    except Exception as e:
+        print(f"Warning: Market discovery error: {e}")
 
-        now = time.time() * 1000
-        live_markets = [m for m in markets if m.get("endDate") and datetime.fromisoformat(m["endDate"].replace('Z', '+00:00')).timestamp() * 1000 > now]
-        if live_markets:
-            live_markets.sort(key=lambda x: x["endDate"])
-            market = live_markets[0]
+    if market:
+        _cached_market = market
+        _cached_market_ts = now
+        _cached_market_series = curr_target
+    return _cached_market
 
+async def fetch_polymarket_snapshot() -> Dict[str, Any]:
+    market = await get_active_market()
     if not market:
         return {"ok": False, "reason": "market_not_found"}
 
@@ -383,12 +404,25 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
     # Track whether the book data came from WS or REST
     book_source = "ws" if ((up_ws.get("bids") or up_ws.get("asks")) and (down_ws.get("bids") or down_ws.get("asks"))) else "rest"
 
+    # Smooth out prices with previous valid state to prevent visual glitching if a poll momentarily drops
+    final_up = up_buy if up_buy is not None else gamma_yes
+    final_down = down_buy if down_buy is not None else gamma_no
+    if final_up is not None:
+        state["last_poly_up"] = final_up
+    else:
+        final_up = state.get("last_poly_up")
+
+    if final_down is not None:
+        state["last_poly_down"] = final_down
+    else:
+        final_down = state.get("last_poly_down")
+
     return {
         "ok": True,
         "market": market,
         "prices": {
-            "up": up_buy if up_buy is not None else gamma_yes,
-            "down": down_buy if down_buy is not None else gamma_no
+            "up": final_up,
+            "down": final_down
         },
         "token_ids": {
             "up": up_token_id,
@@ -632,9 +666,7 @@ async def _redeem_win(trade: Dict[str, Any], market: Optional[Dict[str, Any]],
 
     trade["redeem"] = res
     if res.get("ok"):
-        state["redeem_submitted"][condition_id] = time.time()
         log_message(f"REDEEM ok for {trade['market_slug']}: {amounts[idx]:.2f} shares (tx {res.get('tx')})")
-        _redeem_wake.set()
     else:
         log_message(f"REDEEM FAILED for {trade['market_slug']}: {res.get('error')} "
                     f"— redeem manually via dashboard to free the capital")
@@ -665,6 +697,7 @@ async def update_trades(current_prices: Dict[str, Any]):
             except Exception:
                 end_ts = now_ts
         expired = now_ts >= end_ts
+        trade["awaiting_resolution"] = expired
 
         if expired and trade.get("close_price") is None:
             frozen_close = cur_price or trade.get("last_price")
@@ -684,8 +717,11 @@ async def update_trades(current_prices: Dict[str, Any]):
                 trade["_market"] = fetched
                 trade["_market_closed"] = bool(fetched.get("closed"))
         market_closed = trade.get("_market_closed", False)
+        if market_closed:
+            trade["awaiting_resolution"] = True
 
         if not expired and not market_closed:
+            trade["awaiting_resolution"] = False
             remaining_active.append(trade)
             continue
 
@@ -961,94 +997,6 @@ async def entry_watcher():
         except Exception:
             await asyncio.sleep(0.1)
 
-# ── Manual & background redemption ────────────────────────────────────────────
-async def refresh_redeemable():
-    if state["trading_mode"] != "live":
-        state["redeemable"] = {"positions": [], "count": 0, "value": 0.0, "checked_at": datetime.now().isoformat(), "error": None}
-        return state["redeemable"]
-    funder = clob_trader.get_funder()
-    if not funder:
-        state["redeemable"] = {"positions": [], "count": 0, "value": 0.0, "checked_at": datetime.now().isoformat(), "error": "no_funder"}
-        return state["redeemable"]
-    try:
-        raw_pos = await data.fetch_redeemable_positions(funder)
-        now_ts = time.time()
-        valid_pos = []
-        tot_val = 0.0
-        for p in raw_pos:
-            cid = p.get("conditionId") or p.get("condition_id")
-            size = float(p.get("size") or 0.0)
-            cur_val = float(p.get("currentValue") or (float(p.get("curPrice", 0) or 0) * size) or 0.0)
-            resolved = p.get("resolved") or p.get("redeemable") or (p.get("curPrice") == 1.0)
-            if size > 0 and (resolved or p.get("redeemable")):
-                sub_ts = state["redeem_submitted"].get(cid, 0)
-                if now_ts - sub_ts > REDEEM_SUBMITTED_HIDE_S:
-                    valid_pos.append(p)
-                    tot_val += cur_val if cur_val > 0 else size
-        state["redeemable"] = {
-            "positions": valid_pos,
-            "count": len(valid_pos),
-            "value": round(tot_val, 2),
-            "checked_at": datetime.now().isoformat(),
-            "error": None
-        }
-    except Exception as e:
-        state["redeemable"] = {"positions": [], "count": 0, "value": 0.0, "checked_at": datetime.now().isoformat(), "error": str(e)}
-    return state["redeemable"]
-
-async def _redeem_all_run():
-    async with _redeem_lock:
-        if state["redeem_run"]["busy"]:
-            return state["redeem_run"]
-        state["redeem_run"]["busy"] = True
-        state["redeem_run"]["errors"] = []
-        try:
-            await refresh_redeemable()
-            positions = state["redeemable"].get("positions", [])
-            state["redeem_run"]["total"] = len(positions)
-            state["redeem_run"]["done"] = 0
-            state["redeem_run"]["ok"] = 0
-            state["redeem_run"]["failed"] = 0
-            state["redeem_run"]["value"] = state["redeemable"].get("value", 0.0)
-
-            for p in positions:
-                cid = p.get("conditionId") or p.get("condition_id")
-                size = float(p.get("size") or 0.0)
-                neg_risk = bool(p.get("negRisk") or p.get("neg_risk") or False)
-                outcome_idx = int(p.get("outcomeIndex", 0))
-                amts = [0.0, 0.0]
-                if 0 <= outcome_idx < len(amts):
-                    amts[outcome_idx] = size
-                else:
-                    amts = [size, 0.0]
-                
-                res = await asyncio.to_thread(clob_trader.redeem, cid, amts, neg_risk)
-                state["redeem_run"]["done"] += 1
-                if res.get("ok"):
-                    state["redeem_run"]["ok"] += 1
-                    state["redeem_submitted"][cid] = time.time()
-                    log_message(f"MANUAL REDEEM: Successfully redeemed {size:.2f} shares for condition {cid[:8]}... (tx: {res.get('tx')})")
-                else:
-                    state["redeem_run"]["failed"] += 1
-                    state["redeem_run"]["errors"].append(f"{cid[:8]}: {res.get('error')}")
-                    log_message(f"MANUAL REDEEM FAILED: {res.get('error')} on condition {cid[:8]}...")
-            
-            state["redeem_run"]["finished_at"] = datetime.now().isoformat()
-            save_state()
-            await refresh_redeemable()
-            await broadcast_state()
-        finally:
-            state["redeem_run"]["busy"] = False
-        return state["redeem_run"]
-
-async def redeem_watcher():
-    while True:
-        try:
-            await asyncio.sleep(REDEEM_CHECK_INTERVAL_S)
-            await refresh_redeemable()
-            await broadcast_state()
-        except Exception:
-            pass
 
 async def seed_kline_buffers():
     try:
@@ -1305,7 +1253,13 @@ async def update_loop():
                     "risk": {"type": settings.RISK_TYPE, "value": settings.RISK_VALUE},
                     "symbol": settings.SYMBOL,
                     "withdraw_state": state["withdraw_state"],
-                    "last_withdrawal": state.get("last_withdrawal")
+                    "last_withdrawal": state.get("last_withdrawal"),
+                    "withdraw": {
+                        "enabled": settings.AUTO_WITHDRAW_ENABLED,
+                        "state": "ARMED" if state["withdraw_state"] == "idle" else state["withdraw_state"].upper(),
+                        "amount": settings.WITHDRAW_AMOUNT,
+                        "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE
+                    }
                 },
                 "prices": {
                     "spot": spot_price,
@@ -1343,8 +1297,6 @@ async def update_loop():
 async def lifespan(app: FastAPI):
     load_state()
     await seed_kline_buffers()
-    if state["trading_mode"] == "live":
-        asyncio.create_task(refresh_redeemable())
 
     tasks = [
         asyncio.create_task(binance_stream.start()),
@@ -1355,8 +1307,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(chainlink_ws_stream.start()),
         asyncio.create_task(update_loop()),
         asyncio.create_task(telegram_poller()),
-        asyncio.create_task(entry_watcher()),
-        asyncio.create_task(redeem_watcher())
+        asyncio.create_task(entry_watcher())
     ]
 
     yield
@@ -1384,8 +1335,6 @@ async def websocket_endpoint(websocket: WebSocket):
             "data": state["latest_data"],
             "logs": state["logs"][-30:],
             "log_seq": state["log_seq"],
-            "redeemable": state["redeemable"],
-            "redeem_run": state["redeem_run"],
         })
         await websocket.send_text(init_msg)
         while True:
@@ -1474,36 +1423,6 @@ async def stop_trading():
 async def get_available_series():
     return await data.fetch_available_15m_series()
 
-@app.get("/api/redeemable")
-async def get_redeemable():
-    return await refresh_redeemable()
-
-@app.post("/api/redeem-all")
-async def redeem_all():
-    if state["trading_mode"] != "live":
-        return {"ok": False, "error": "live_mode_only"}
-    if state["redeem_run"]["busy"]:
-        return {"ok": False, "error": "already_running"}
-    res = await _redeem_all_run()
-    return {"ok": True, "result": res}
-
-@app.post("/api/redeem")
-async def redeem_single(req: Dict[str, Any]):
-    if state["trading_mode"] != "live":
-        return {"ok": False, "error": "live_mode_only"}
-    condition_id = req.get("condition_id")
-    amounts = req.get("amounts", [0.0, 0.0])
-    neg_risk = bool(req.get("neg_risk", False))
-    if not condition_id:
-        return {"ok": False, "error": "missing_condition_id"}
-    res = await asyncio.to_thread(clob_trader.redeem, condition_id, amounts, neg_risk)
-    if res.get("ok"):
-        state["redeem_submitted"][condition_id] = time.time()
-        save_state()
-        await refresh_redeemable()
-        await broadcast_state()
-    return res
-
 @app.get("/api/settings")
 async def get_settings():
     def mask(v: str) -> str:
@@ -1550,9 +1469,12 @@ async def get_settings():
             "enabled": settings.AUTO_WITHDRAW_ENABLED,
             "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE,
             "withdraw_amount": settings.WITHDRAW_AMOUNT,
+            "withdraw_address": settings.WITHDRAW_ADDRESS,
             "recipient_address": settings.WITHDRAW_ADDRESS,
             "auto_resume": settings.WITHDRAW_AUTO_RESUME,
-            "resume_after": settings.WITHDRAW_RESUME_AFTER
+            "auto_resume_after_withdrawal": settings.WITHDRAW_AUTO_RESUME,
+            "resume_after": settings.WITHDRAW_RESUME_AFTER,
+            "default_destination": clob_trader.get_eoa_address() or ""
         },
         "telegram": {
             "enabled": settings.TELEGRAM_ENABLED,
@@ -1654,8 +1576,10 @@ async def post_settings(new_settings: Dict[str, Any]):
         if "enabled" in ce: settings.AUTO_WITHDRAW_ENABLED = bool(ce["enabled"])
         if "trigger_balance" in ce: settings.WITHDRAW_TRIGGER_BALANCE = float(ce["trigger_balance"])
         if "withdraw_amount" in ce: settings.WITHDRAW_AMOUNT = float(ce["withdraw_amount"])
-        if "recipient_address" in ce: settings.WITHDRAW_ADDRESS = str(ce["recipient_address"]).strip()
-        if "auto_resume" in ce: settings.WITHDRAW_AUTO_RESUME = bool(ce["auto_resume"])
+        addr = ce.get("withdraw_address") if "withdraw_address" in ce else ce.get("recipient_address")
+        if addr is not None: settings.WITHDRAW_ADDRESS = str(addr).strip()
+        auto_res = ce.get("auto_resume_after_withdrawal") if "auto_resume_after_withdrawal" in ce else ce.get("auto_resume")
+        if auto_res is not None: settings.WITHDRAW_AUTO_RESUME = bool(auto_res)
         if "resume_after" in ce: settings.WITHDRAW_RESUME_AFTER = str(ce["resume_after"]).strip()
 
     if "telegram" in new_settings:
@@ -1737,6 +1661,58 @@ async def enable_auto_redeem():
         return result
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+@app.get("/api/telegram-subscribers")
+async def get_telegram_subscribers():
+    subs = state.get("telegram_subscribers", [])
+    out = []
+    for s in subs:
+        out.append({
+            "chat_id": s,
+            "name": f"Chat {s}",
+            "type": "chat"
+        })
+    return {"subscribers": out, "count": len(out)}
+
+@app.post("/api/telegram-unsubscribe")
+async def post_telegram_unsubscribe(req: Dict[str, Any]):
+    chat_id = req.get("chat_id")
+    if chat_id is not None:
+        try:
+            cid = int(chat_id)
+            remove_telegram_subscriber(cid)
+            return {"ok": True}
+        except (ValueError, TypeError):
+            pass
+    return {"ok": False, "error": "invalid_chat_id"}
+
+@app.post("/api/test-telegram")
+async def post_test_telegram():
+    if not settings.TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "No bot token configured"}
+    subs = state.get("telegram_subscribers", [])
+    if not subs:
+        return {"ok": False, "error": "No subscribers yet. Send /start to the bot on Telegram first."}
+
+    test_msg = "🔔 *Polymarket 15m Assistant Test Notification*\nTelegram alerts are functioning properly!"
+    sent_count = 0
+    errors = []
+    for chat_id in subs:
+        try:
+            url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+            proxy = ws_data.get_proxy_url_for(url)
+            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
+                resp = await client.post(url, json={"chat_id": chat_id, "text": test_msg, "parse_mode": "Markdown"})
+                if resp.status_code == 200:
+                    sent_count += 1
+                else:
+                    errors.append(f"HTTP {resp.status_code}")
+        except Exception as e:
+            errors.append(str(e))
+
+    if sent_count > 0:
+        return {"ok": True, "count": sent_count}
+    return {"ok": False, "error": "; ".join(errors) if errors else "Failed to send message"}
 
 @app.get("/health")
 async def health():

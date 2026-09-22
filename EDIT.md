@@ -112,3 +112,58 @@ This document details all modifications made to the codebase to port requested f
 |---|---|
 | `templates/index.html` | Fixed `applySnapshot` WS frame unpacking; `'NaN'` → `'--'` in 6 expressions |
 | `main.py` | Added `book_source` to `fetch_polymarket_snapshot()` and `latest_data.prices` |
+
+---
+
+## Post-Launch Backend & UI Compatibility Fixes (Session 3)
+
+### 10. Telegram Management Endpoints — `main.py`
+- Added missing REST endpoints queried by `templates/settings.html`:
+  - `GET /api/telegram-subscribers`: returns formatted list of current subscribers.
+  - `POST /api/telegram-unsubscribe`: removes a subscriber given `{ "chat_id": id }`.
+  - `POST /api/test-telegram`: dispatches a live test notification to all active subscribers with error reporting.
+
+### 11. Capital Extractor UI & Config Field Synchronization — `bot/config.py` & `main.py`
+- In `bot/config.py` and `main.py`: supported both `withdraw_address` and `recipient_address`, as well as `auto_resume_after_withdrawal` and `auto_resume`.
+- In `GET /api/settings`: added `default_destination` derived from EOA key so user sees their target address when `withdraw_address` is blank.
+- In `main.py`: added `withdraw` dictionary (`enabled`, `state`, `amount`, `trigger_balance`) to `latest_data.trading_state` so the header status badge (`⤓ ARMED`) lights up in `templates/index.html`.
+
+### 12. Redeemable Positions & Active Trade Polish — `main.py`
+- In `refresh_redeemable()`: populated `condition_id`, `value`, `from_bot`, and `has_key` on redeemable position dicts.
+- In `update_trades()`: explicitly set `awaiting_resolution` flag when an expired position waits for Polymarket settlement.
+
+### Files Touched in Session 3
+| File | Change |
+|---|---|
+| `main.py` | Added Telegram REST routes, Capital Extractor aliases, withdraw badge state, and redeem position mapping |
+| `bot/config.py` | Supported `withdraw_address` and `auto_resume_after_withdrawal` config aliases |
+| `EDIT.md` | Documented Session 3 changes |
+
+---
+
+## Polymarket Odds Glitch Fix & Order Book Overhaul (Session 4)
+
+### 13. Polymarket CLOB Book Sorting & Delta Bug — `bot/ws_data.py`
+- **Root cause 1 (Inverted Best Bid/Ask)**: In `PolymarketClobMarketStream._process_msg`, the initial book snapshot assigned `best_bid = float(bids[0]["price"])` and `best_ask = float(asks[0]["price"])`. In Polymarket CLOB snapshots, bids are sent sorted ascending (from 0.01 up to market) and asks ascending (from 0.99 down or 0.51 up). Consequently, `bids[0]` was picking `0.01` (1¢) and `asks[0]` was picking `0.99` (99¢), resulting in an artificial 98¢ spread.
+- **Root cause 2 (Delta Level Overwrite)**: In the delta loop, any price update on side `"BUY"` or `"SELL"` directly assigned `book["best_bid"] = float(pc["price"])`, even if the update was for an order deep in the book (e.g. 0.15 or 0.85). Every limit order placed or canceled across the entire book was resetting the top-of-book quotes.
+- **Root cause 3 (Websocket Drops)**: Text frames containing `"PONG"`, `"PING"`, or `"OK"` were being parsed with `json.loads()`, causing unhandled exceptions that severed the WebSocket connection every 30-60s.
+- **Fix**:
+  - Maintained `book_levels` maps (`bids`: `{price: size}`, `asks`: `{price: size}`) that track live depth across all levels.
+  - Sorted bids descending (`reverse=True`) so `bids[0]` is always the true highest bid.
+  - Sorted asks ascending so `asks[0]` is always the true lowest ask.
+  - Added safe ping loop and non-JSON frame filtering to keep the CLOB Market WS connected indefinitely without drops.
+
+### 14. Market Discovery Caching & Price Smoothing — `main.py`
+- **Root cause**: `fetch_polymarket_snapshot()` was issuing a REST request to `gamma-api.polymarket.com/events` on every 1000ms loop tick. Gamma API's rate-limiter intermittently rejected these requests with HTTP 429 / timeouts, causing `poly_snapshot` to fail and wiping `poly_up` / `poly_down` to `None` on intermittent ticks.
+- **Fix**: Added `get_active_market()` cache that retains the current 15m market for up to 30s and only re-fetches when nearing the 15-second window expiration boundary (pre-fetching the next window). Added state-backed price smoothing (`state["last_poly_up"]` / `state["last_poly_down"]`) to prevent single-tick visual drops.
+
+### 15. Odds Display Rendering — `templates/index.html`
+- Changed odds binding in `templates/index.html` to check `!= null` rather than truthiness, preventing zeros or edge prices from evaluating to falsy dashes.
+
+### Files Touched in Session 4
+| File | Change |
+|---|---|
+| `bot/ws_data.py` | Rewrote `PolymarketClobMarketStream` with true sorted depth map, safe delta handling, and keepalive ping loop |
+| `main.py` | Added `get_active_market()` cache and price smoothing in `fetch_polymarket_snapshot()` |
+| `templates/index.html` | Updated odds display expressions with `!= null` checks |
+| `EDIT.md` | Documented Session 4 changes |
