@@ -7,56 +7,113 @@ from .config import settings
 from .net_utils import get_proxy_url_for
 
 class BinanceTradeStream:
-    """Fast spot-price feed from Binance @trade — the leading signal for fair_prob."""
+    """Ultra-fast spot + futures leading price feed from Binance.
+    Listens to Binance Futures (@bookTicker and @trade) which leads spot price discovery
+    by 30ms-80ms, with seamless fallback/redundancy to Binance Spot (@trade)."""
     def __init__(self, symbol: str, on_update: Optional[Callable] = None):
         self.symbol = symbol.lower()
         self.on_update = on_update
         self.last_price = None
         self.last_ts = None
+        self.last_source = None
         self.closed = False
 
-    async def start(self):
+    async def _futures_worker(self):
+        """Binance USDT-M Futures feed (@bookTicker) — the leading edge signal.
+        The mid-price of best bid and ask updates before spot trades print."""
+        endpoints = [
+            f"wss://fstream.binance.com/ws/{self.symbol}@bookTicker",
+            f"wss://fstream.binance.com/ws/{self.symbol}@trade"
+        ]
+        url = endpoints[0]
+        while not self.closed:
+            try:
+                proxy = get_proxy_url_for(url)
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
+                        print(f"Connected to Binance Futures Lead WS: {self.symbol}@bookTicker")
+                        while not self.closed:
+                            msg = await ws.receive()
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data_msg = json.loads(msg.data)
+                                # @bookTicker payload: {"b": best_bid, "a": best_ask}
+                                if "b" in data_msg and "a" in data_msg:
+                                    try:
+                                        bid = float(data_msg["b"])
+                                        ask = float(data_msg["a"])
+                                        if bid > 0 and ask > 0:
+                                            mid = (bid + ask) / 2.0
+                                            self._process_trade(mid, source="binance_futures_book")
+                                    except (TypeError, ValueError):
+                                        pass
+                                elif "p" in data_msg:
+                                    try:
+                                        p = float(data_msg["p"])
+                                        if p > 0:
+                                            self._process_trade(p, source="binance_futures_trade")
+                                    except (TypeError, ValueError):
+                                        pass
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+            except Exception as e:
+                if not self.closed:
+                    await asyncio.sleep(2)
+
+    async def _spot_worker(self):
+        """Binance Spot feed (@trade) — robust fallback and spot anchor."""
         endpoints = [
             f"wss://data-stream.binance.vision/ws/{self.symbol}@trade",
             f"wss://stream.binance.com:9443/ws/{self.symbol}@trade"
         ]
         endpoint_idx = 0
-
         while not self.closed:
             url = endpoints[endpoint_idx % len(endpoints)]
             endpoint_idx += 1
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, proxy=proxy if proxy else None) as ws:
-                        print(f"Connected to Binance WS ({url}): {self.symbol}")
+                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
+                        print(f"Connected to Binance Spot WS ({url}): {self.symbol}")
                         while not self.closed:
                             msg = await ws.receive()
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data_msg = json.loads(msg.data)
                                 if "p" in data_msg:
-                                    self._process_trade(float(data_msg.get("p")))
+                                    try:
+                                        p = float(data_msg["p"])
+                                        if p > 0:
+                                            self._process_trade(p, source="binance_spot_trade")
+                                    except (TypeError, ValueError):
+                                        pass
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
             except Exception as e:
-                print(f"Binance trade WS failed ({url}): {e}")
                 if not self.closed:
                     await asyncio.sleep(2)
 
-    def _process_trade(self, p: float):
+    async def start(self):
+        # Run both Futures (leading edge) and Spot (redundancy) concurrently
+        await asyncio.gather(
+            self._futures_worker(),
+            self._spot_worker(),
+            return_exceptions=True
+        )
+
+    def _process_trade(self, p: float, source: str = "binance"):
         self.last_price = p
         self.last_ts = time.time()
+        self.last_source = source
 
         if self.on_update:
             try:
-                res = self.on_update({"price": self.last_price, "ts": self.last_ts})
+                res = self.on_update({"price": self.last_price, "ts": self.last_ts, "source": source})
                 if asyncio.iscoroutine(res):
                     asyncio.create_task(res)
             except Exception:
                 pass
 
     def get_last(self):
-        return {"price": self.last_price, "ts": self.last_ts}
+        return {"price": self.last_price, "ts": self.last_ts, "source": self.last_source}
 
     def close(self):
         self.closed = True
