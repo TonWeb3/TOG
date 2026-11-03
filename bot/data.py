@@ -3,6 +3,14 @@ from .config import settings
 from typing import List, Dict, Optional
 from .net_utils import get_proxy_url_for
 
+BINANCE_REST_HOSTS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com"
+]
+
 def to_number(x) -> Optional[float]:
     try:
         if x is None:
@@ -13,17 +21,26 @@ def to_number(x) -> Optional[float]:
         return None
 
 async def fetch_klines(symbol: str, interval: str, limit: int) -> List[Dict]:
-    """Fetch historical klines with automatic retry and validation to guarantee full
-    dataset for indicator computation (HA & RSI)."""
-    url = f"{settings.BINANCE_BASE_URL}/api/v3/klines"
+    """Fetch historical klines with automatic multi-endpoint fallback and validation
+    to guarantee full dataset for indicator computation (HA and RSI)."""
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    proxy = get_proxy_url_for(url)
     last_err = None
-    for attempt in range(3):
+
+    seen_hosts = set()
+    hosts = []
+    for h in [settings.BINANCE_BASE_URL] + BINANCE_REST_HOSTS:
+        if h and h not in seen_hosts:
+            seen_hosts.add(h)
+            hosts.append(h)
+
+    for host in hosts:
+        url = f"{host}/api/v3/klines"
+        proxy = get_proxy_url_for(url)
         try:
-            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:
+            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
                 res = await client.get(url, params=params)
-                res.raise_for_status()
+                if res.status_code != 200:
+                    continue
                 data = res.json()
                 if not isinstance(data, list) or len(data) == 0:
                     continue
@@ -40,19 +57,35 @@ async def fetch_klines(symbol: str, interval: str, limit: int) -> List[Dict]:
                     return klines
         except Exception as e:
             last_err = e
+            continue
+
     if last_err:
-        print(f"Warning: fetch_klines failed after retries: {last_err}")
+        print(f"Warning: fetch_klines failed after trying all endpoints: {last_err}")
     return []
 
 async def fetch_last_price(symbol: str) -> Optional[float]:
-    url = f"{settings.BINANCE_BASE_URL}/api/v3/ticker/price"
     params = {"symbol": symbol}
-    proxy = get_proxy_url_for(url)
-    async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
-        res = await client.get(url, params=params)
-        res.raise_for_status()
-        data = res.json()
-        return to_number(data.get("price"))
+    seen_hosts = set()
+    hosts = []
+    for h in [settings.BINANCE_BASE_URL] + BINANCE_REST_HOSTS:
+        if h and h not in seen_hosts:
+            seen_hosts.add(h)
+            hosts.append(h)
+
+    for host in hosts:
+        url = f"{host}/api/v3/ticker/price"
+        proxy = get_proxy_url_for(url)
+        try:
+            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=3.0) as client:
+                res = await client.get(url, params=params)
+                if res.status_code == 200:
+                    data = res.json()
+                    p = to_number(data.get("price"))
+                    if p and p > 0:
+                        return p
+        except Exception:
+            continue
+    return None
 
 async def fetch_market_by_slug(slug: str) -> Optional[Dict]:
     url = f"{settings.GAMMA_BASE_URL}/markets"

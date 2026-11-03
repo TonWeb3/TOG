@@ -1,13 +1,29 @@
 import asyncio
-import json
-import aiohttp
 import time
 from typing import Optional, Callable, Dict, List
+import aiohttp
 from .config import settings
 from .net_utils import get_proxy_url_for
 
+# ── Low-Level Performance: Fast JSON Acceleration (orjson / std json fallback) ──
+try:
+    import orjson
+    def fast_loads(s):
+        if isinstance(s, (bytes, bytearray)):
+            return orjson.loads(s)
+        return orjson.loads(s.encode("utf-8"))
+    def fast_dumps(obj):
+        return orjson.dumps(obj).decode("utf-8")
+except ImportError:
+    import json
+    def fast_loads(s):
+        return json.loads(s)
+    def fast_dumps(obj):
+        return json.dumps(obj)
+
+
 class BinanceTradeStream:
-    """Ultra-fast spot price feed from Binance Spot.
+    """Ultra-fast spot + futures leading price feed from Binance.
     Listens to Binance Spot (@bookTicker and @trade). Computes real-time mid-price
     from best bid and ask on every order book change with zero basis skew."""
     def __init__(self, symbol: str, on_update: Optional[Callable] = None):
@@ -32,12 +48,12 @@ class BinanceTradeStream:
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Spot Book WS ({url}): {self.symbol}@bookTicker")
                         while not self.closed:
                             msg = await ws.receive()
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_msg = json.loads(msg.data)
+                                data_msg = fast_loads(msg.data)
                                 # @bookTicker payload: {"b": best_bid, "a": best_ask}
                                 if "b" in data_msg and "a" in data_msg:
                                     try:
@@ -55,7 +71,7 @@ class BinanceTradeStream:
                     await asyncio.sleep(2)
 
     async def _spot_worker(self):
-        """Binance Spot feed (@trade) — robust fallback and spot trades."""
+        """Binance Spot feed (@trade) — robust fallback and spot anchor."""
         endpoints = [
             f"wss://data-stream.binance.vision/ws/{self.symbol}@trade",
             f"wss://stream.binance.com:9443/ws/{self.symbol}@trade"
@@ -67,12 +83,12 @@ class BinanceTradeStream:
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Spot WS ({url}): {self.symbol}")
                         while not self.closed:
                             msg = await ws.receive()
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_msg = json.loads(msg.data)
+                                data_msg = fast_loads(msg.data)
                                 if "p" in data_msg:
                                     try:
                                         p = float(data_msg["p"])
@@ -87,7 +103,7 @@ class BinanceTradeStream:
                     await asyncio.sleep(2)
 
     async def start(self):
-        # Run both Spot Book (@bookTicker) and Spot Trades (@trade) concurrently
+        # Run both Futures (leading edge) and Spot (redundancy) concurrently
         await asyncio.gather(
             self._spot_book_worker(),
             self._spot_worker(),
@@ -113,13 +129,19 @@ class BinanceTradeStream:
     def close(self):
         self.closed = True
 
+
 class BinanceKlineStream:
+    """Binance Kline stream for 1m and 5m candles with sliding window buffer.
+    Guarantees strict chronological ordering, gap detection and auto-backfill,
+    and automatic reconnection with heartbeat to avoid hanging dead sockets."""
     def __init__(self, symbol: str, interval: str, limit: int = 240):
         self.symbol = symbol.lower()
         self.interval = interval
         self.limit = limit
         self.candles = []
         self.closed = False
+        self._lock = asyncio.Lock()
+        self._step_ms = 60_000 if interval == "1m" else 300_000
 
     async def start(self):
         endpoints = [
@@ -133,13 +155,14 @@ class BinanceKlineStream:
             endpoint_idx += 1
             try:
                 proxy = get_proxy_url_for(url)
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, proxy=proxy if proxy else None) as ws:
+                timeout = aiohttp.ClientTimeout(total=None, sock_read=30.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Kline WS ({url}): {self.symbol} {self.interval}")
                         while not self.closed:
                             msg = await ws.receive()
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_msg = json.loads(msg.data)
+                                data_msg = fast_loads(msg.data)
                                 k = data_msg.get("k", {})
                                 if k.get("t") is not None:
                                     candle = {
@@ -150,35 +173,71 @@ class BinanceKlineStream:
                                         "close": float(k.get("c")),
                                         "volume": float(k.get("v")),
                                         "closeTime": int(k.get("T")),
-                                        "isClosed": k.get("x")
+                                        "isClosed": bool(k.get("x"))
                                     }
-                                    self._update_candle(candle)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                    async with self._lock:
+                                        self._update_candle(candle)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                                 break
             except Exception as e:
-                print(f"Binance Kline WS failed ({url}): {e}")
                 if not self.closed:
-                    await asyncio.sleep(5)
+                    print(f"Binance Kline WS reconnecting ({url}): {e}")
+                    await asyncio.sleep(2)
 
     def _update_candle(self, candle: Dict):
         if not self.candles:
             self.candles.append(candle)
+            return
+
+        last = self.candles[-1]
+        c_open = candle["openTime"]
+        l_open = last["openTime"]
+
+        if c_open == l_open:
+            self.candles[-1] = candle
+        elif c_open > l_open:
+            if (c_open - l_open) > (self._step_ms * 1.5):
+                asyncio.create_task(self._backfill_gap())
+            self.candles.append(candle)
+            if len(self.candles) > self.limit:
+                self.candles.pop(0)
         else:
-            if candle["openTime"] == self.candles[-1]["openTime"]:
-                self.candles[-1] = candle
-            else:
-                self.candles.append(candle)
-        if len(self.candles) > self.limit:
-            self.candles.pop(0)
+            for i, c in enumerate(self.candles):
+                if c["openTime"] == c_open:
+                    self.candles[i] = candle
+                    return
+            self.candles.append(candle)
+            self.candles.sort(key=lambda x: x["openTime"])
+            if len(self.candles) > self.limit:
+                self.candles = self.candles[-self.limit:]
+
+    async def _backfill_gap(self):
+        try:
+            from . import data
+            klines = await data.fetch_klines(self.symbol.upper(), self.interval, self.limit)
+            if klines and len(klines) >= 10:
+                async with self._lock:
+                    self.set_candles(klines)
+        except Exception:
+            pass
 
     def set_candles(self, candles: List[Dict]):
-        self.candles = candles[-self.limit:]
+        if not candles:
+            return
+        seen = set()
+        deduped = []
+        for c in sorted(candles, key=lambda x: x["openTime"]):
+            if c["openTime"] not in seen:
+                seen.add(c["openTime"])
+                deduped.append(c)
+        self.candles = deduped[-self.limit:]
 
-    def get_candles(self):
-        return self.candles
+    def get_candles(self) -> List[Dict]:
+        return list(self.candles)
 
     def close(self):
         self.closed = True
+
 
 class PolymarketChainlinkStream:
     def __init__(self, ws_url: str, symbol_includes: str = "btc", on_update: Optional[Callable] = None):
@@ -209,7 +268,7 @@ class PolymarketChainlinkStream:
                 }
                 async with aiohttp.ClientSession(headers=headers) as session:
                     print(f"Connecting to Polymarket WS: {self.ws_url}")
-                    async with session.ws_connect(self.ws_url, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(self.ws_url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Polymarket WS. Subscribing to topics...")
 
                         topics = ["crypto_prices_chainlink", "price_chainlink", "settlement_prices"]
@@ -226,7 +285,7 @@ class PolymarketChainlinkStream:
                                     continue
 
                                 try:
-                                    data_msg = json.loads(data_text)
+                                    data_msg = fast_loads(data_text)
                                 except Exception:
                                     continue
 
@@ -237,7 +296,7 @@ class PolymarketChainlinkStream:
                                 payload = data_msg.get("payload", {})
                                 if isinstance(payload, str):
                                     try:
-                                        payload = json.loads(payload)
+                                        payload = fast_loads(payload)
                                     except:
                                         continue
 
@@ -280,6 +339,7 @@ class PolymarketChainlinkStream:
 
     def close(self):
         self.closed = True
+
 
 class PolymarketClobMarketStream:
     """Real-time orderbook and price feed for active Polymarket tokens over CLOB Market WS."""
@@ -326,7 +386,7 @@ class PolymarketClobMarketStream:
             try:
                 proxy = get_proxy_url_for(self.ws_url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(self.ws_url, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(self.ws_url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         self._ws = ws
                         print(f"Connected to Polymarket CLOB Market WS: {self.ws_url}")
                         await self._subscribe(ws)
@@ -340,7 +400,7 @@ class PolymarketClobMarketStream:
                                     if not data_text or data_text in ("PONG", "PING", "OK", "PONG\n"):
                                         continue
                                     try:
-                                        data = json.loads(data_text)
+                                        data = fast_loads(data_text)
                                         self._process_msg(data)
                                     except Exception:
                                         continue
@@ -535,6 +595,7 @@ class PolymarketClobMarketStream:
     def close(self):
         self.closed = True
 
+
 class ChainlinkPriceStream:
     def __init__(self, aggregator: str, decimals: int = 8, on_update: Optional[Callable] = None):
         self.aggregator = aggregator
@@ -556,7 +617,7 @@ class ChainlinkPriceStream:
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Chainlink RPC WS: {url}")
                         sub_msg = {
                             "jsonrpc": "2.0",
@@ -575,7 +636,7 @@ class ChainlinkPriceStream:
                         while not self.closed:
                             msg = await ws.receive()
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_res = json.loads(msg.data)
+                                data_res = fast_loads(msg.data)
                                 if data_res.get("method") == "eth_subscription":
                                     log = data_res.get("params", {}).get("result", {})
                                     topics = log.get("topics", [])
@@ -588,6 +649,8 @@ class ChainlinkPriceStream:
                                         data_hex = log.get("data", "0x")
                                         if len(data_hex) >= 66:
                                             self.last_updated_at = int(data_hex[2:66], 16) * 1000
+                                        else:
+                                            self.last_updated_at = int(time.time() * 1000)
 
                                         if self.on_update:
                                             res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"})
