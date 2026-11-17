@@ -213,7 +213,7 @@
                     <div>
                         <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Private Key or Seed Phrase</label>
                         <input type="password" x-model="form.private_key" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition" placeholder="0x...  or  twelve word seed phrase">
-                        <p class="text-[10px] text-gray-500 mt-2 italic">Your trading wallet is <strong>derived</strong> from this. It signs every order but holds no funds and needs no gas. A 12/24-word seed is converted to a hex key on save.</p>
+                        <p class="text-[10px] text-gray-500 mt-2 italic">Your trading wallet &amp; CLOB API credentials are <strong>derived</strong> from this. In <strong>Paper Mode</strong>, this key/seed authenticates to Polymarket's <strong>PolyBolt TWAP Price Stream</strong> so the bot gets the exact 60-second TWAP <strong>Price to Beat (Open)</strong> and resolution without placing live orders. A 12/24-word seed is converted to a hex key on save.</p>
                     </div>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                         <div>

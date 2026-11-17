@@ -91,11 +91,44 @@ class ClobTrader:
             return self._api_creds
         from polymarket_apis.clients.clob_client import PolymarketClobClient
         from eth_account import Account
-        eoa = Account.from_key(settings.PRIVATE_KEY).address
-        c = PolymarketClobClient(private_key=settings.PRIVATE_KEY, address=eoa,
+        from .config import normalize_private_key
+        pk = normalize_private_key(settings.PRIVATE_KEY)
+        if not pk:
+            return None
+        settings.PRIVATE_KEY = pk
+        eoa = Account.from_key(pk).address
+        c = PolymarketClobClient(private_key=pk, address=eoa,
                                  chain_id=137, signature_type=3)
         self._api_creds = c.create_or_derive_api_creds()
         return self._api_creds
+
+    def get_polybolt_creds(self) -> Optional[Dict[str, str]]:
+        """Return {"apiKey", "secret", "passphrase"} derived from PRIVATE_KEY (hex key or
+        12/24-word seed phrase) for authenticating to Polymarket's PolyBolt TWAP stream.
+        Works in both Paper Mode and Live Mode without requiring Polygon RPC."""
+        if not settings.PRIVATE_KEY:
+            return None
+        c = getattr(self.clob, "creds", None) if self.clob is not None else None
+        if not c or not getattr(c, "key", None):
+            c = self._api_creds
+        if not c or not getattr(c, "key", None):
+            is_live = (getattr(settings, "MODE", "paper") or "paper").lower() == "live"
+            if is_live:
+                try:
+                    self.ensure_ready()
+                    c = getattr(self.clob, "creds", None) if self.clob is not None else None
+                except Exception:
+                    c = None
+            if not c or not getattr(c, "key", None):
+                with self._lock:
+                    try:
+                        c = self._derive_creds()
+                    except Exception as e:
+                        self.last_error = f"{type(e).__name__}: {e}"
+                        return None
+        if not c or not getattr(c, "key", None):
+            return None
+        return {"apiKey": str(c.key), "secret": str(c.secret), "passphrase": str(c.passphrase)}
 
     def _new_gasless(self, signature_type: int):
         # Gasless on-chain client. Two distinct roles:

@@ -1,7 +1,7 @@
 import os
 import json
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 
 CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config.json"))
 
@@ -106,6 +106,7 @@ class Settings(BaseSettings):
     HTTP_PROXY: str = os.getenv("HTTP_PROXY", os.getenv("http_proxy", ""))
     HTTPS_PROXY: str = os.getenv("HTTPS_PROXY", os.getenv("https_proxy", ""))
     ALL_PROXY: str = os.getenv("ALL_PROXY", os.getenv("all_proxy", ""))
+    PRICE_STREAM: Dict[str, Any] = {}
 
 def normalize_private_key(secret: str) -> str:
     """Accept either a raw hex private key or a 12/24-word seed phrase and return a
@@ -125,6 +126,11 @@ def normalize_private_key(secret: str) -> str:
 
 def load_settings():
     base_settings = Settings()
+    try:                                   # PATCH: price stream — its defaults
+        from bot import polybolt as _polybolt
+        base_settings.PRICE_STREAM = _polybolt.merged({})
+    except Exception:
+        base_settings.PRICE_STREAM = {}
     config_path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else "config.json"
     if os.path.exists(config_path):
         try:
@@ -205,6 +211,13 @@ def load_settings():
                 if "polygon_wss_url" in cl: base_settings.POLYGON_WSS_URL = cl["polygon_wss_url"]
                 if "btc_usd_aggregator" in cl: base_settings.CHAINLINK_BTC_USD_AGGREGATOR = cl["btc_usd_aggregator"]
                 if "alchemy_api_key" in cl: base_settings.ALCHEMY_API_KEY = cl["alchemy_api_key"]
+
+            if "price_stream" in config_data:
+                try:
+                    from bot import polybolt as _polybolt
+                    base_settings.PRICE_STREAM = _polybolt.normalize(config_data["price_stream"], base_settings.PRICE_STREAM)
+                except Exception as e:
+                    print(f"Warning: Failed to load price_stream config: {e}")
 
             # Legacy flat keys fallback
             if "auto_withdraw_enabled" in config_data and "capital_extractor" not in config_data:

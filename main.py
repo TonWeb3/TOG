@@ -21,6 +21,7 @@ import bot.indicators as indicators
 import bot.engines as engines
 import bot.utils as utils
 from bot.clob_trader import clob_trader
+from bot import polybolt
 
 STATE_PATH = "state_data.json"
 SIGNALS_PATH = os.path.join("logs", "signals.csv")
@@ -36,6 +37,7 @@ POLY_WS_MAX_AGE_MS = 2500
 MARK_CAPTURE_WINDOW_MS = 20_000
 
 _market_event = asyncio.Event()
+_loop_wake = asyncio.Event()
 _entry_lock = asyncio.Lock()
 _last_eval_ts = 0.0
 
@@ -253,12 +255,142 @@ binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL, on_update=_w
 binance_kline_1m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="1m", limit=240)
 binance_kline_5m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="5m", limit=200)
 
+def _on_poly_chainlink_tick(data_payload=None):
+    if not isinstance(data_payload, dict):
+        return
+    w_ms = int(settings.CANDLE_WINDOW_MINUTES * 60_000)
+    start = int(time.time() * 1000) // w_ms * w_ms
+    win = state.get("market_opens", {}).get(start)
+    if (win is None or win.get("chainlink") is None) and float(data_payload.get("updatedAt") or 0) >= start:
+        _loop_wake.set()
+
 polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
     ws_url=settings.POLYMARKET_LIVE_DATA_WS_URL,
-    symbol_includes=get_ws_symbol_filter(settings.SYMBOL)
+    symbol_includes=get_ws_symbol_filter(settings.SYMBOL),
+    on_update=_on_poly_chainlink_tick
 )
 polymarket_clob_ws = ws_data.PolymarketClobMarketStream()
 chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL))
+
+# ── PATCH: price stream (config.json "price_stream"; bot/polybolt.py) ─────────────────────────
+# Polymarket's own reference prices over its price socket: the live Chainlink price and the 60-second
+# average (TWAP) the 15-minute markets are decided on. Uses the CLOB API credentials derived from
+# settings.PRIVATE_KEY (hex private key or 12/24-word seed phrase) in BOTH Paper Mode and Live Mode.
+def _ps_creds():
+    """The CLOB API credentials derived from the private key / seed phrase, for the PolyBolt socket login.
+    Works in Paper Mode as well as Live Mode. None without a key."""
+    if not settings.PRIVATE_KEY:
+        return None
+    return clob_trader.get_polybolt_creds()
+
+
+def _ps_on_live(ts: float, price: float) -> None:
+    pass
+
+
+def _ps_on_twap(ts: float, price: float) -> None:
+    """When the 60-second TWAP average for the current window's opening arrives, wake update_loop
+    immediately so the Price to Beat (polymarket_twap) is marked right away."""
+    if not _ps_use("prices"):
+        return
+    w_ms = int(settings.CANDLE_WINDOW_MINUTES * 60_000)
+    start_ms = int(time.time() * 1000) // w_ms * w_ms
+    start_s = start_ms / 1000.0
+    if start_s - 1e-6 <= ts <= start_s + _ps_tol():
+        _loop_wake.set()
+        _market_event.set()
+
+
+polybolt_feed = polybolt.PolyBolt(
+    get_creds=_ps_creds,
+    enabled=lambda: polybolt.on(settings.PRICE_STREAM),
+    log=lambda m: log_message(m),
+    symbol=polybolt.symbol_for(settings.SYMBOL),
+    proxy=ws_data.get_proxy_url_for(polybolt.URL) or None,
+    on_live=_ps_on_live,
+    on_twap=_ps_on_twap,
+)
+_ps_noted: set = set()            # window starts whose price-to-beat line is in the log
+_ps_lag_said = [0.0]              # when the "stamped behind this computer's clock" line was last logged
+
+
+def _ps_use(what: str) -> bool:
+    return polybolt.use(settings.PRICE_STREAM, what)
+
+
+def _ps_tol() -> float:
+    return float((settings.PRICE_STREAM or {}).get("pick_tolerance_s") or 2.0)
+
+
+def _ps_live_as_poly_ws(poly_ws: Dict[str, Any]) -> Dict[str, Any]:
+    """update_loop: with "prices" on, Polymarket's live Chainlink price from the price socket, in the shape of
+    the old Polymarket feed's last price — while it is fresh: it arrived, and is stamped, within
+    POLY_WS_MAX_AGE_MS. Otherwise poly_ws as it is (the bot then goes on with its other feeds, as before)."""
+    if not _ps_use("prices"):
+        return poly_ws
+    live = polybolt_feed.live(POLY_WS_MAX_AGE_MS / 1000.0)
+    if not live:
+        return poly_ws
+    behind_ms = (time.time() - live[0]) * 1000.0
+    if behind_ms > POLY_WS_MAX_AGE_MS:
+        if time.time() - _ps_lag_said[0] > 600:
+            _ps_lag_said[0] = time.time()
+            log_message(f"PRICE STREAM: its live price is stamped {behind_ms / 1000.0:.1f}s behind this computer's clock — "
+                        "not used as the bot's price (the bot keeps its own feed)")
+        return poly_ws
+    return {"price": live[1], "updatedAt": live[0] * 1000.0}
+
+
+def _ps_strike(start_ms: int, strike_open: Optional[float], strike_source: str):
+    """update_loop: the window's strike. With "prices" on and Polymarket's 60-second average for the window's
+    start published: that average, which is the price to beat. Else the bot's own, as before."""
+    if not _ps_use("prices"):
+        return strike_open, strike_source
+    ptb = polybolt_feed.twap_at(start_ms / 1000.0, _ps_tol())
+    return (ptb, "polymarket_twap") if ptb is not None else (strike_open, strike_source)
+
+
+def _ps_window_note(start_ms: int, window_ms: int, own_strike: Optional[float]) -> None:
+    """update_loop: one log line per window once Polymarket's average for its start is in: the window's price
+    to beat next to the bot's own strike, and how the window before it closed on these numbers."""
+    if start_ms in _ps_noted or not polybolt.on(settings.PRICE_STREAM):
+        return
+    pt = polybolt_feed.twap_point_at(start_ms / 1000.0, _ps_tol())
+    if pt is None or (own_strike is None and time.time() * 1000 - start_ms < MARK_CAPTURE_WINDOW_MS):
+        return
+    if len(_ps_noted) > 200:
+        _ps_noted.clear()
+    _ps_noted.add(start_ms)
+    avg, late = pt[1], pt[0] - start_ms / 1000.0
+    label = datetime.fromtimestamp(start_ms / 1000).strftime('%H:%M')
+    text = (f"PRICE STREAM: Polymarket's 60-second average at {label}" + (f" (stamped {late:.1f}s after it)" if late >= 0.05 else "")
+            + f" is {avg:,.2f}: the {label} window's price to beat.")
+    if own_strike and abs(own_strike - avg) >= 0.005:
+        gap = own_strike - avg
+        text += f" The bot's own strike: {own_strike:,.2f} (${abs(gap):,.2f} {'higher' if gap >= 0 else 'lower'})."
+    before = polybolt_feed.twap_at((start_ms - window_ms) / 1000.0, _ps_tol())
+    if before is not None:
+        prev = datetime.fromtimestamp((start_ms - window_ms) / 1000).strftime('%H:%M')
+        text += (f" On these numbers the {prev} window closed {'UP' if avg >= before else 'DOWN'}: "
+                 f"${abs(avg - before):,.2f} {'above' if avg >= before else 'below'} its price to beat {before:,.2f}.")
+    log_message(text)
+
+
+def _ps_settle_call(trade: Dict[str, Any]):
+    """update_trades: (winner, closing average, opening average) on Polymarket's own 60-second averages, with
+    "settle" on and both published; None otherwise (the bot then compares its own two prices, as before)."""
+    start, end = trade.get("window_start_ms"), trade.get("end_ts")
+    if not _ps_use("settle") or not start or not end:
+        return None
+    start, end = float(start) / 1000.0, float(end)
+    dur = end - start
+    if not (240 <= dur <= 360 or 840 <= dur <= 960 or abs(dur - settings.CANDLE_WINDOW_MINUTES * 60) <= 2.0):
+        return None          # not one whole window: left to the bot's own rule
+    opened = polybolt_feed.twap_at(start, _ps_tol())
+    closed = polybolt_feed.twap_at(end, _ps_tol())
+    if opened is None or closed is None:
+        return None
+    return ("UP" if closed >= opened else "DOWN"), closed, opened
 
 def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
     now_ms = time.time() * 1000
@@ -760,10 +892,22 @@ async def update_trades(current_prices: Dict[str, Any]):
             if trade.get("expired_at") is None:
                 trade["expired_at"] = now_ts
             waited = now_ts - trade["expired_at"]
-            if waited < settings.AUTHORITATIVE_SETTLE_WAIT_S and not market_closed:
+
+            _pt = _ps_settle_call(trade)             # PATCH: price stream — Polymarket's own two averages, when both are there
+            if not _pt and waited < settings.AUTHORITATIVE_SETTLE_WAIT_S and not market_closed:
                 remaining_active.append(trade)
                 continue
-            if strike and settlement_price:
+
+            if _pt:
+                winning_index = up_index if _pt[0] == "UP" else down_index
+                resolution = "close_vs_open"
+                strike, settlement_price = _pt[2], _pt[1]
+                trade["settlement_price_at_expiry"] = trade["close_price"] = settlement_price
+                trade["settle_wait_s"] = round(waited, 1)
+                trade["settle_feed"] = "polymarket_twap"
+                log_message(f"SETTLEMENT for {trade['market_slug']}: "
+                            f"resolved locally on Polymarket's 60-second averages (close {settlement_price:.2f} vs open {strike:.2f} => {_pt[0]})")
+            elif strike and settlement_price:
                 trade["settlement_price_at_expiry"] = settlement_price
                 winning_index = up_index if settlement_price > strike else down_index
                 resolution = "close_vs_open"
@@ -1033,6 +1177,7 @@ async def update_loop():
                 cl_ws_last = chainlink_ws_stream.get_last()
                 binance_ws["price"] = poly_ws_last.get("price") or cl_ws_last.get("price")
             poly_ws = polymarket_ws_stream.get_last()
+            poly_ws = _ps_live_as_poly_ws(poly_ws)   # PATCH: price stream — Polymarket's live price from the price socket, while "prices" is on and it is fresh
             cl_ws = chainlink_ws_stream.get_last()
 
             results = await asyncio.gather(
@@ -1093,8 +1238,20 @@ async def update_loop():
             start_ms = event_start_ms
             win = mark_window_open(start_ms, window_ms, current_price, spot_price, price_source, price_is_fresh=price_is_fresh)
 
-            strike_open = win["chainlink"]
+            own_strike = win["chainlink"]
+            strike_open = own_strike
             strike_source = "chainlink_ws"
+            # PATCH: price stream — the price to beat, once Polymarket has published it; and its line in the log
+            strike_open, strike_source = _ps_strike(start_ms, strike_open, strike_source)
+            if strike_open is not None and win.get("chainlink") is None:
+                win["chainlink"] = strike_open
+                win["genuine"] = True
+            if strike_source == "polymarket_twap" and strike_open is not None:
+                for _t in state.get("active_trades", []):
+                    if _t.get("window_start_ms") == int(start_ms) and _t.get("strike_source") != "polymarket_twap":
+                        _t["strike_price"] = strike_open
+                        _t["strike_source"] = "polymarket_twap"
+            _ps_window_note(start_ms, window_ms, own_strike)
 
             model_open = None
             for c in reversed(klines_5m):
@@ -1275,7 +1432,8 @@ async def update_loop():
                     "model_open": model_open,
                     "window_start_ms": start_ms,
                     "price_is_fresh": price_is_fresh,
-                    "book_source": poly_snapshot.get("book_source") if poly_snapshot.get("ok") else None
+                    "book_source": poly_snapshot.get("book_source") if poly_snapshot.get("ok") else None,
+                    "price_stream": polybolt_feed.view() if polybolt.on(settings.PRICE_STREAM) else None   # PATCH: price stream
                 },
                 "indicators": {
                     "rsi": rsi_now,
@@ -1294,7 +1452,23 @@ async def update_loop():
         except Exception as e:
             print(f"Error in update loop: {e}")
 
-        await asyncio.sleep(settings.POLL_INTERVAL_MS / 1000)
+        await _wait_next_pass()
+
+
+async def _wait_next_pass():
+    """Sleep until update_loop's next pass: POLL_INTERVAL_MS as before, but never past the
+    next window opening (the pass at the open used to come up to POLL_INTERVAL_MS late),
+    and right away when _loop_wake is set (the new window's first Chainlink price or TWAP)."""
+    poll_s = settings.POLL_INTERVAL_MS / 1000
+    w_ms = settings.CANDLE_WINDOW_MINUTES * 60_000
+    to_open_s = (w_ms - (time.time() * 1000) % w_ms) / 1000 + 0.002
+    if not _loop_wake.is_set():
+        try:
+            await asyncio.wait_for(_loop_wake.wait(), timeout=max(0.0, min(poll_s, to_open_s)))
+        except asyncio.TimeoutError:
+            pass
+    _loop_wake.clear()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1308,16 +1482,31 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(polymarket_ws_stream.start()),
         asyncio.create_task(polymarket_clob_ws.start()),
         asyncio.create_task(chainlink_ws_stream.start()),
+        asyncio.create_task(polybolt_feed.run_forever()),  # PATCH: price stream — connects to Polymarket price socket
         asyncio.create_task(update_loop()),
         asyncio.create_task(telegram_poller()),
         asyncio.create_task(entry_watcher())
     ]
+    log_message(polybolt.status_line(settings.PRICE_STREAM))   # PATCH: price stream
+
+    # Pre-warm CLOB trader client / credentials in background thread if private key set
+    if settings.PRIVATE_KEY:
+        async def _warm_live():
+            try:
+                if (getattr(settings, "MODE", "paper") or "paper").lower() == "live":
+                    await asyncio.to_thread(clob_trader.ensure_ready)
+                else:
+                    await asyncio.to_thread(clob_trader.get_polybolt_creds)
+            except Exception as e:
+                log_message(f"CLOB pre-warm note: {e}")
+        asyncio.create_task(_warm_live())
 
     yield
 
     for task in tasks:
         task.cancel()
 
+    polybolt_feed.closed = True
     binance_stream.close()
     binance_kline_1m.close()
     binance_kline_5m.close()
@@ -1593,6 +1782,8 @@ async def post_settings(new_settings: Dict[str, Any]):
             settings.TELEGRAM_BOT_TOKEN = str(tok).strip()
 
     clob_trader.reset()
+    polybolt_feed.set_symbol(polybolt.symbol_for(settings.SYMBOL))   # PATCH: price stream — follows the bot's symbol
+    polybolt_feed.wake()                                             # wake immediately if key or price_stream changed
 
     state["trading_mode"] = settings.MODE
     state["paper_balance"] = settings.PAPER_BALANCE_USD
@@ -1615,7 +1806,8 @@ async def post_settings(new_settings: Dict[str, Any]):
         polymarket_ws_stream.close()
         polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
             ws_url=settings.POLYMARKET_LIVE_DATA_WS_URL,
-            symbol_includes=get_ws_symbol_filter(settings.SYMBOL)
+            symbol_includes=get_ws_symbol_filter(settings.SYMBOL),
+            on_update=_on_poly_chainlink_tick
         )
         asyncio.create_task(polymarket_ws_stream.start())
 
@@ -1628,6 +1820,8 @@ async def post_settings(new_settings: Dict[str, Any]):
 
 @app.post("/api/setup-wallet")
 async def setup_wallet():
+    clob_trader.reset()
+    polybolt_feed.wake()
     try:
         result = await asyncio.to_thread(clob_trader.ensure_setup)
         if result.get("ok"):
@@ -1644,6 +1838,8 @@ async def setup_wallet():
 
 @app.post("/api/test-connection")
 async def test_connection():
+    clob_trader.reset()
+    polybolt_feed.wake()
     try:
         result = await asyncio.to_thread(clob_trader.test_connection)
         if result.get("ok"):
@@ -1657,6 +1853,8 @@ async def test_connection():
 
 @app.post("/api/enable-auto-redeem")
 async def enable_auto_redeem():
+    clob_trader.reset()
+    polybolt_feed.wake()
     try:
         result = await asyncio.to_thread(clob_trader.enable_auto_redeem)
         log_message("Auto-redeem enabled" if result.get("ok")
