@@ -252,6 +252,7 @@ def get_ws_symbol_filter(symbol: str) -> str:
     return s.lower()
 
 binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL, on_update=_wake_entry)
+basis_tracker = indicators.BasisTracker(halflife_s=30.0)
 binance_kline_1m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="1m", limit=240)
 binance_kline_5m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="5m", limit=200)
 
@@ -1103,7 +1104,8 @@ async def evaluate_entry(reason: str = "event"):
         else:
             tau_s = max(0.5, ctx["time_left_min"] * 60.0 - max(0.0, now - ctx.get("built_at", now)))
         sigma_s = ctx.get("sigma_s")
-        fair_up = indicators.fair_prob_up(spot_price, ctx["target_open"], tau_s, sigma_s)
+        model_spot = basis_tracker.adjust(spot_price, now) if ctx.get("use_basis") else spot_price
+        fair_up = indicators.fair_prob_up(model_spot, ctx["target_open"], tau_s, sigma_s)
 
         market_up = ctx["prices"]["up"]
         market_down = ctx["prices"]["down"]
@@ -1266,7 +1268,14 @@ async def update_loop():
                     model_open = c["open"]
                     break
             model_open = model_open or win.get("binance") or spot_price
-            target_open = model_open if strike_open is not None else None
+
+            # Update smoothed Binance - Chainlink basis and compare basis-adjusted spot
+            # directly against Polymarket's actual TWAP strike_open (Price to Beat).
+            if spot_price and current_price and price_is_fresh:
+                basis_tracker.update(spot_price, current_price)
+            use_basis = basis_tracker.ready()
+            model_spot = basis_tracker.adjust(spot_price) if use_basis else spot_price
+            target_open = (strike_open if use_basis else model_open) if strike_open is not None else None
 
             settlement_ms = None
             if poly_snapshot["ok"] and poly_snapshot["market"].get("endDate"):
@@ -1278,7 +1287,7 @@ async def update_loop():
             sigma_s = (indicators.ewma_vol_per_sqrt_s(klines_1m, span=30, bar_seconds=60.0)
                        or indicators.ewma_vol_per_sqrt_s(klines_5m, span=12, bar_seconds=300.0))
             sigma_5m = (sigma_s * math.sqrt(300.0)) if sigma_s else None
-            fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, tau_s, sigma_s)
+            fair_up = indicators.fair_prob_up(model_spot or 0, target_open or 0, tau_s, sigma_s)
             fair_data = {
                 "prob_up": fair_up,
                 "prob_down": 1.0 - fair_up,
@@ -1337,6 +1346,7 @@ async def update_loop():
                     "start_ms": start_ms,
                     "settlement_ms": settlement_ms,
                     "target_open": target_open,
+                    "use_basis": use_basis,
                     "strike_open": strike_open,
                     "strike_source": strike_source,
                     "time_left_min": time_left_min,
@@ -1816,6 +1826,7 @@ async def post_settings(new_settings: Dict[str, Any]):
     state["paper_balance"] = settings.PAPER_BALANCE_USD
 
     if settings.SYMBOL != old_symbol:
+        basis_tracker.reset()
         binance_stream.close()
         binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL, on_update=_wake_entry)
         asyncio.create_task(binance_stream.start())

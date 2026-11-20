@@ -125,3 +125,52 @@ def fair_prob_up(current_price: float, strike: float, tau_s: float,
     z = math.log(current_price / strike) / sd
     prob = 0.5 * math.erfc(-z / math.sqrt(2.0))
     return float(min(1.0, max(0.0, prob)))
+
+
+class BasisTracker:
+    """Tracks the smoothed live spread (binance_spot - chainlink_live) via a
+    time-weighted EMA so fast Binance ticks can be mapped onto Chainlink's exact
+    price scale and compared directly against Polymarket's TWAP strike_open."""
+
+    def __init__(self, halflife_s: float = 30.0, max_age_s: float = 120.0):
+        self.halflife_s = float(halflife_s)
+        self.max_age_s = float(max_age_s)
+        self.value: Optional[float] = None
+        self.last_ts: float = 0.0
+
+    def reset(self) -> None:
+        self.value = None
+        self.last_ts = 0.0
+
+    def ready(self, now: Optional[float] = None) -> bool:
+        if self.value is None:
+            return False
+        t = time.time() if now is None else float(now)
+        return (t - self.last_ts) <= self.max_age_s
+
+    def update(self, binance_spot: Optional[float], chainlink_live: Optional[float],
+               now: Optional[float] = None) -> Optional[float]:
+        if not binance_spot or not chainlink_live or binance_spot <= 0 or chainlink_live <= 0:
+            return self.value
+        raw = float(binance_spot) - float(chainlink_live)
+        # Guard against mismatched symbol / corrupt feed spikes (> 2% spread)
+        if abs(raw) > 0.02 * float(chainlink_live):
+            return self.value
+        t = time.time() if now is None else float(now)
+        if self.value is None or (t - self.last_ts) > self.max_age_s:
+            self.value = raw
+        else:
+            dt = max(0.0, t - self.last_ts)
+            if dt > 0.0:
+                alpha = 1.0 - math.exp(-math.log(2.0) * dt / self.halflife_s)
+                self.value = (1.0 - alpha) * self.value + alpha * raw
+        self.last_ts = t
+        return self.value
+
+    def adjust(self, binance_spot: Optional[float], now: Optional[float] = None) -> Optional[float]:
+        if not binance_spot or binance_spot <= 0:
+            return binance_spot
+        if self.ready(now):
+            adj = float(binance_spot) - float(self.value)
+            return adj if adj > 0 else float(binance_spot)
+        return float(binance_spot)
