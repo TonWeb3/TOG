@@ -1,3 +1,4 @@
+import math
 from typing import Dict, Any
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8,12 +9,16 @@ from typing import Dict, Any
 #  market. The only edge left is LATENCY: act on a Binance spot move before
 #  Polymarket's thin book reprices.
 #
-#  The decision is purely a fast fair probability (from Binance spot) vs the
-#  market's implied price. Enter when the gap (expected value) is large enough
-#  that the book looks stale. RSI and Heiken-Ashi survive only as veto filters.
+#  The decision is purely a fast zero-drift continuous-time fair probability
+#  (from Binance spot + short EWMA vol) vs the market's implied price, gated by
+#  a live Binance spot impulse so we only trade genuine fresh latency gaps.
+#  RSI and Heiken-Ashi survive only as veto filters.
 # ─────────────────────────────────────────────────────────────────────────────
 
-EXHAUSTION_BARS = 6  # a Heiken-Ashi streak this long is over-extended → veto chasing it
+EXHAUSTION_BARS = 6    # a Heiken-Ashi streak this long is over-extended → veto chasing it
+IMPULSE_LOOKBACK_S = 8.0  # seconds for fresh Binance spot impulse confirmation
+IMPULSE_VOL_MULT = 0.25   # require spot move >= 0.25σ over IMPULSE_LOOKBACK_S
+IMPULSE_MIN_BPS = 0.00005 # 0.5 bps floor so micro bid-ask ticks don't pass as impulses
 
 
 def _no_ev(reason: str) -> Dict[str, Any]:
@@ -67,6 +72,24 @@ def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
         return _no_ev(f"prob_{p:.2f}_below_{min_prob:.2f}")
     if ev < ev_threshold:
         return _no_ev(f"ev_{ev:.3f}_below_{ev_threshold:.3f}")
+
+    # ── Binance Impulse Gate (real latency dislocation required) ──
+    impulse = inputs.get("impulse")
+    if impulse is None:
+        return _no_ev("no_binance_impulse")
+    spot_px = inputs.get("spotPrice")
+    sigma_s = inputs.get("sigmaPerSqrtS")
+    min_move = 0.0
+    if spot_px and spot_px > 0:
+        min_move = float(spot_px) * IMPULSE_MIN_BPS
+        if sigma_s and sigma_s > 0:
+            vol_move = IMPULSE_VOL_MULT * float(spot_px) * float(sigma_s) * math.sqrt(IMPULSE_LOOKBACK_S)
+            if vol_move > min_move:
+                min_move = vol_move
+    if side == "UP" and impulse < min_move:
+        return _no_ev(f"no_up_impulse ({impulse:+.2f} < +{min_move:.2f})")
+    if side == "DOWN" and impulse > -min_move:
+        return _no_ev(f"no_down_impulse ({impulse:+.2f} > -{min_move:.2f})")
 
     strength = "HIGH_CONVICTION" if p >= 0.70 else "STRONG"
     return {

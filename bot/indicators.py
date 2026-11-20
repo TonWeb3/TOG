@@ -68,8 +68,7 @@ def count_consecutive(ha_candles: List[Dict]) -> Dict:
 
 
 def realized_drift_vol(candles: List[Dict], lookback: int = 300):
-    """(mean, std) of per-candle log returns — the per-step drift & sigma for the
-    fair-prob model. Returns (None, None) if there isn't enough data."""
+    """(mean, std) of per-candle log returns. Returns (None, None) if there isn't enough data."""
     closes = [c["close"] for c in candles[-lookback:] if c.get("close")]
     if len(closes) < 20:
         return None, None
@@ -81,21 +80,48 @@ def realized_drift_vol(candles: List[Dict], lookback: int = 300):
     return float(np.mean(rets)), float(np.std(rets))
 
 
-def fair_prob_up(current_price: float, strike: float, steps: int,
-                 sigma_per_step: Optional[float], drift_per_step: float = 0.0) -> float:
-    """Closed-form GBM probability that price closes ABOVE `strike` after `steps`
-    5-minute intervals — the core direction/edge model. The model is just
-    persistence: "is spot above the open, given the volatility still to come?"
+def ewma_vol_per_sqrt_s(candles: List[Dict], span: int = 30, bar_seconds: float = 60.0) -> Optional[float]:
+    """Short-horizon RiskMetrics EWMA volatility scaled to per-sqrt-second.
+    Uses zero-mean squared log returns so recent volatility regime changes are
+    captured quickly without multi-hour stale vol lag."""
+    if not candles or bar_seconds <= 0:
+        return None
+    max_bars = max(120, int(span) * 4)
+    closes = [float(c["close"]) for c in candles[-max_bars:] if c.get("close") and float(c["close"]) > 0]
+    if len(closes) < 12:
+        return None
+    arr = np.asarray(closes, dtype=float)
+    rets = np.diff(np.log(arr))
+    rets = rets[np.isfinite(rets)]
+    if len(rets) < 10:
+        return None
+    alpha = 2.0 / (max(2, int(span)) + 1.0)
+    lam = 1.0 - alpha
+    init_n = min(10, len(rets))
+    var = float(np.mean(rets[:init_n] ** 2))
+    for r in rets[init_n:]:
+        var = lam * var + alpha * float(r * r)
+    if var <= 0.0:
+        return None
+    return float(math.sqrt(var) / math.sqrt(float(bar_seconds)))
+
+
+def fair_prob_up(current_price: float, strike: float, tau_s: float,
+                 sigma_per_sqrt_s: Optional[float]) -> float:
+    """Zero-drift continuous-time GBM probability that price closes ABOVE `strike`
+    after `tau_s` remaining seconds:
+        z = ln(spot / strike) / (sigma * sqrt(tau_s))
+        P(S_T > K) = Phi(z) = 0.5 * erfc(-z / sqrt(2))
     Returns 0..1.
     """
     if not current_price or not strike or current_price <= 0 or strike <= 0:
         return 0.5
-    n = max(1, int(steps))
-    if sigma_per_step is None or sigma_per_step <= 0:
-        return 1.0 if current_price > strike else 0.0
-    mu = (drift_per_step - 0.5 * sigma_per_step ** 2) * n
-    sd = sigma_per_step * math.sqrt(n)
-    # P(S * exp(X) > K) for X ~ N(mu, sd^2)  ->  1 - Phi(z)  ->  0.5 * erfc(z/sqrt2)
-    z = (math.log(strike / current_price) - mu) / sd
-    prob = 0.5 * math.erfc(z / math.sqrt(2))
+    tau = max(float(tau_s), 0.5)
+    if sigma_per_sqrt_s is None or sigma_per_sqrt_s <= 0:
+        return 1.0 if current_price > strike else (0.5 if current_price == strike else 0.0)
+    sd = float(sigma_per_sqrt_s) * math.sqrt(tau)
+    if sd <= 0:
+        return 1.0 if current_price > strike else (0.5 if current_price == strike else 0.0)
+    z = math.log(current_price / strike) / sd
+    prob = 0.5 * math.erfc(-z / math.sqrt(2.0))
     return float(min(1.0, max(0.0, prob)))

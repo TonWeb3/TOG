@@ -888,12 +888,19 @@ async def update_trades(current_prices: Dict[str, Any]):
         strike = trade.get("strike_price")
         settlement_price = (trade.get("close_price") or trade.get("settlement_price_at_expiry")
                             or trade.get("last_price") or cur_price)
+        _pt = _ps_settle_call(trade)             # PATCH: price stream — Polymarket's own two 60s TWAP averages (open & close)
+        if _pt:
+            strike, settlement_price = _pt[2], _pt[1]
+            trade["strike_price"] = strike
+            trade["open_price"] = strike
+            trade["settlement_price_at_expiry"] = trade["close_price"] = settlement_price
+            trade["settle_feed"] = "polymarket_twap"
+
         if winning_index == -1 and (expired or market_closed):
             if trade.get("expired_at") is None:
                 trade["expired_at"] = now_ts
             waited = now_ts - trade["expired_at"]
 
-            _pt = _ps_settle_call(trade)             # PATCH: price stream — Polymarket's own two averages, when both are there
             if not _pt and waited < settings.AUTHORITATIVE_SETTLE_WAIT_S and not market_closed:
                 remaining_active.append(trade)
                 continue
@@ -901,10 +908,7 @@ async def update_trades(current_prices: Dict[str, Any]):
             if _pt:
                 winning_index = up_index if _pt[0] == "UP" else down_index
                 resolution = "close_vs_open"
-                strike, settlement_price = _pt[2], _pt[1]
-                trade["settlement_price_at_expiry"] = trade["close_price"] = settlement_price
                 trade["settle_wait_s"] = round(waited, 1)
-                trade["settle_feed"] = "polymarket_twap"
                 log_message(f"SETTLEMENT for {trade['market_slug']}: "
                             f"resolved locally on Polymarket's 60-second averages (close {settlement_price:.2f} vs open {strike:.2f} => {_pt[0]})")
             elif strike and settlement_price:
@@ -1094,10 +1098,12 @@ async def evaluate_entry(reason: str = "event"):
         if not spot_price:
             return
 
-        mc_steps = max(1, math.ceil(ctx["time_left_min"] / 5))
-        fair_up = indicators.fair_prob_up(
-            spot_price, ctx["target_open"], mc_steps, ctx["sigma_5m"], drift_per_step=ctx["drift_5m"]
-        )
+        if ctx.get("settlement_ms"):
+            tau_s = max(0.5, (ctx["settlement_ms"] - now * 1000.0) / 1000.0)
+        else:
+            tau_s = max(0.5, ctx["time_left_min"] * 60.0 - max(0.0, now - ctx.get("built_at", now)))
+        sigma_s = ctx.get("sigma_s")
+        fair_up = indicators.fair_prob_up(spot_price, ctx["target_open"], tau_s, sigma_s)
 
         market_up = ctx["prices"]["up"]
         market_down = ctx["prices"]["down"]
@@ -1118,6 +1124,9 @@ async def evaluate_entry(reason: str = "event"):
             "rsi": ctx["rsi"],
             "haExhaustedGreen": ctx["ha_exhausted_green"],
             "haExhaustedRed": ctx["ha_exhausted_red"],
+            "impulse": binance_stream.get_impulse(engines.IMPULSE_LOOKBACK_S),
+            "spotPrice": spot_price,
+            "sigmaPerSqrtS": sigma_s,
         })
 
         if decision.get("action") == "ENTER":
@@ -1196,8 +1205,6 @@ async def update_loop():
 
             spot_price = binance_ws.get("price") if binance_ws and binance_ws.get("price") else last_price
 
-            mc_steps = max(1, math.ceil(timing["remainingMinutes"] / 5))
-
             # Settle feed & freshness
             current_price = None
             price_source = None
@@ -1261,21 +1268,24 @@ async def update_loop():
             model_open = model_open or win.get("binance") or spot_price
             target_open = model_open if strike_open is not None else None
 
-            drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
-            fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
-            fair_data = {
-                "prob_up": fair_up,
-                "prob_down": 1.0 - fair_up,
-                "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
-                "steps": mc_steps,
-                "sigma_5m": sigma_5m,
-            }
-
             settlement_ms = None
             if poly_snapshot["ok"] and poly_snapshot["market"].get("endDate"):
                 settlement_ms = datetime.fromisoformat(poly_snapshot["market"]["endDate"].replace('Z', '+00:00')).timestamp() * 1000
 
-            time_left_min = (settlement_ms - time.time() * 1000) / 60_000 if settlement_ms else timing["remainingMinutes"]
+            tau_s = max(0.5, (settlement_ms - time.time() * 1000.0) / 1000.0) if settlement_ms else max(0.5, timing["remainingMs"] / 1000.0)
+            time_left_min = tau_s / 60.0
+
+            sigma_s = (indicators.ewma_vol_per_sqrt_s(klines_1m, span=30, bar_seconds=60.0)
+                       or indicators.ewma_vol_per_sqrt_s(klines_5m, span=12, bar_seconds=300.0))
+            sigma_5m = (sigma_s * math.sqrt(300.0)) if sigma_s else None
+            fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, tau_s, sigma_s)
+            fair_data = {
+                "prob_up": fair_up,
+                "prob_down": 1.0 - fair_up,
+                "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
+                "tau_s": round(tau_s, 1),
+                "sigma_5m": sigma_5m,
+            }
 
             closes = [c["close"] for c in klines_1m]
             rsi_now = indicators.compute_rsi(closes, settings.RSI_PERIOD)
@@ -1315,6 +1325,9 @@ async def update_loop():
                 "rsi": rsi_now,
                 "haExhaustedGreen": ha_exhausted_green,
                 "haExhaustedRed": ha_exhausted_red,
+                "impulse": binance_stream.get_impulse(engines.IMPULSE_LOOKBACK_S),
+                "spotPrice": spot_price,
+                "sigmaPerSqrtS": sigma_s,
             })
 
             # Publish trade_ctx for event watcher early entries
@@ -1322,12 +1335,13 @@ async def update_loop():
                 state["trade_ctx"] = {
                     "built_at": time.time(),
                     "start_ms": start_ms,
+                    "settlement_ms": settlement_ms,
                     "target_open": target_open,
                     "strike_open": strike_open,
                     "strike_source": strike_source,
                     "time_left_min": time_left_min,
+                    "sigma_s": sigma_s,
                     "sigma_5m": sigma_5m,
-                    "drift_5m": drift_5m or 0.0,
                     "rsi": rsi_now,
                     "ha_exhausted_green": ha_exhausted_green,
                     "ha_exhausted_red": ha_exhausted_red,
@@ -1497,6 +1511,7 @@ async def lifespan(app: FastAPI):
                     await asyncio.to_thread(clob_trader.ensure_ready)
                 else:
                     await asyncio.to_thread(clob_trader.get_polybolt_creds)
+                polybolt_feed.wake()
             except Exception as e:
                 log_message(f"CLOB pre-warm note: {e}")
         asyncio.create_task(_warm_live())
@@ -1783,7 +1798,19 @@ async def post_settings(new_settings: Dict[str, Any]):
 
     clob_trader.reset()
     polybolt_feed.set_symbol(polybolt.symbol_for(settings.SYMBOL))   # PATCH: price stream — follows the bot's symbol
-    polybolt_feed.wake()                                             # wake immediately if key or price_stream changed
+    if settings.PRIVATE_KEY:
+        async def _rewarm_polybolt():
+            try:
+                if (getattr(settings, "MODE", "paper") or "paper").lower() == "live":
+                    await asyncio.to_thread(clob_trader.ensure_ready)
+                else:
+                    await asyncio.to_thread(clob_trader.get_polybolt_creds)
+            except Exception as e:
+                log_message(f"PolyBolt cred refresh note: {e}")
+            polybolt_feed.wake()
+        asyncio.create_task(_rewarm_polybolt())
+    else:
+        polybolt_feed.wake()                                         # wake immediately if key or price_stream changed
 
     state["trading_mode"] = settings.MODE
     state["paper_balance"] = settings.PAPER_BALANCE_USD

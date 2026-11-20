@@ -32,6 +32,7 @@ class BinanceTradeStream:
         self.last_price = None
         self.last_ts = None
         self.last_source = None
+        self._price_history = []
         self.closed = False
 
     async def _spot_book_worker(self):
@@ -111,9 +112,15 @@ class BinanceTradeStream:
         )
 
     def _process_trade(self, p: float, source: str = "binance"):
+        now_t = time.time()
         self.last_price = p
-        self.last_ts = time.time()
+        self.last_ts = now_t
         self.last_source = source
+
+        self._price_history.append((now_t, p))
+        cutoff = now_t - 60.0
+        if len(self._price_history) > 1200 or (self._price_history and self._price_history[0][0] < cutoff):
+            self._price_history = [(t, pr) for t, pr in self._price_history if t >= cutoff]
 
         if self.on_update:
             try:
@@ -122,6 +129,29 @@ class BinanceTradeStream:
                     asyncio.create_task(res)
             except Exception:
                 pass
+
+    def get_impulse(self, lookback_s: float = 8.0) -> Optional[float]:
+        """Exact Binance spot price change over the last `lookback_s` seconds (current - past).
+        Returns None until at least 1.0s of recent tick history is available."""
+        if not self._price_history or self.last_price is None or self.last_ts is None:
+            return None
+        now_ts = time.time()
+        if now_ts - self.last_ts > 5.0:
+            return None
+        if now_ts - self._price_history[0][0] < min(1.0, float(lookback_s) * 0.5):
+            return None
+        target_ts = now_ts - float(lookback_s)
+        past_price = None
+        for t, pr in self._price_history:
+            if t <= target_ts:
+                past_price = pr
+            else:
+                if past_price is None:
+                    past_price = pr
+                break
+        if past_price is None:
+            past_price = self._price_history[0][1]
+        return float(self.last_price) - float(past_price)
 
     def get_last(self):
         return {"price": self.last_price, "ts": self.last_ts, "source": self.last_source}
