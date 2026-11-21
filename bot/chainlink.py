@@ -11,6 +11,8 @@ AGGREGATOR_ABI = [
 class ChainlinkFetcher:
     def __init__(self):
         self.cached_decimals = None
+        self._last_aggregator = None
+        self._w3_cache: Dict[str, AsyncWeb3] = {}
         self.cached_result = {"price": None, "updatedAt": None, "source": "chainlink"}
         self.cached_fetched_at_ms = 0
         self.min_fetch_interval_ms = 2000
@@ -40,10 +42,16 @@ class ChainlinkFetcher:
         if not rpcs:
             return {"price": None, "updatedAt": None, "source": "missing_config"}
 
-        aggregator_address = settings.CHAINLINK_BTC_USD_AGGREGATOR
+        aggregator_address = settings.get_aggregator(settings.SYMBOL)
+        if self._last_aggregator != aggregator_address:
+            self._last_aggregator = aggregator_address
+            self.cached_decimals = None
         for rpc in rpcs:
             try:
-                w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc, request_kwargs={'timeout': 3.0}))
+                w3 = self._w3_cache.get(rpc)
+                if w3 is None:
+                    w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc, request_kwargs={'timeout': 3.0}))
+                    self._w3_cache[rpc] = w3
                 contract = w3.eth.contract(address=AsyncWeb3.to_checksum_address(aggregator_address), abi=AGGREGATOR_ABI)
 
                 if self.cached_decimals is None:

@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import time
 from typing import Optional, Callable, Dict, List
 import aiohttp
@@ -32,7 +33,7 @@ class BinanceTradeStream:
         self.last_price = None
         self.last_ts = None
         self.last_source = None
-        self._price_history = []
+        self._price_history = collections.deque()
         self.closed = False
 
     async def _spot_book_worker(self):
@@ -52,7 +53,7 @@ class BinanceTradeStream:
                     async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Spot Book WS ({url}): {self.symbol}@bookTicker")
                         while not self.closed:
-                            msg = await ws.receive()
+                            msg = await ws.receive(timeout=30.0)
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data_msg = fast_loads(msg.data)
                                 # @bookTicker payload: {"b": best_bid, "a": best_ask}
@@ -87,7 +88,7 @@ class BinanceTradeStream:
                     async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Spot WS ({url}): {self.symbol}")
                         while not self.closed:
-                            msg = await ws.receive()
+                            msg = await ws.receive(timeout=30.0)
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data_msg = fast_loads(msg.data)
                                 if "p" in data_msg:
@@ -119,8 +120,10 @@ class BinanceTradeStream:
 
         self._price_history.append((now_t, p))
         cutoff = now_t - 60.0
-        if len(self._price_history) > 1200 or (self._price_history and self._price_history[0][0] < cutoff):
-            self._price_history = [(t, pr) for t, pr in self._price_history if t >= cutoff]
+        while self._price_history and self._price_history[0][0] < cutoff:
+            self._price_history.popleft()
+        while len(self._price_history) > 6000:
+            self._price_history.popleft()
 
         if self.on_update:
             try:
@@ -190,7 +193,7 @@ class BinanceKlineStream:
                     async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Kline WS ({url}): {self.symbol} {self.interval}")
                         while not self.closed:
-                            msg = await ws.receive()
+                            msg = await ws.receive(timeout=30.0)
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data_msg = fast_loads(msg.data)
                                 k = data_msg.get("k", {})
@@ -305,67 +308,75 @@ class PolymarketChainlinkStream:
                         for t in topics:
                             await ws.send_json({"action": "subscribe", "topic": t})
 
-                        asyncio.create_task(ping_loop(ws))
-
-                        while not self.closed:
-                            msg = await ws.receive()
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_text = msg.data
-                                if data_text in ("PONG", "OK", "PONG\n"):
-                                    continue
-
-                                try:
-                                    data_msg = fast_loads(data_text)
-                                except Exception:
-                                    continue
-
-                                topic = data_msg.get("topic")
-                                if topic not in ("crypto_prices_chainlink", "price_chainlink", "settlement_prices"):
-                                    continue
-
-                                payload = data_msg.get("payload", {})
-                                if isinstance(payload, str):
-                                    try:
-                                        payload = fast_loads(payload)
-                                    except:
+                        ping_task = asyncio.create_task(ping_loop(ws))
+                        try:
+                            while not self.closed:
+                                msg = await ws.receive(timeout=30.0)
+                                if msg.type == aiohttp.WSMsgType.TEXT:
+                                    data_text = msg.data
+                                    if data_text in ("PONG", "OK", "PONG\n"):
                                         continue
 
-                                updates = payload if isinstance(payload, list) else [payload]
+                                    try:
+                                        data_msg = fast_loads(data_text)
+                                    except Exception:
+                                        continue
 
-                                for update in updates:
-                                    if not isinstance(update, dict): continue
+                                    topic = data_msg.get("topic")
+                                    if topic not in ("crypto_prices_chainlink", "price_chainlink", "settlement_prices"):
+                                        continue
 
-                                    sym = str(update.get("symbol") or update.get("pair") or update.get("ticker") or update.get("asset") or "").lower()
-                                    if self.symbol_includes:
-                                        target = self.symbol_includes.lower()
-                                        if target not in sym and not (target == "btc" and "bitcoin" in sym):
+                                    payload = data_msg.get("payload", {})
+                                    if isinstance(payload, str):
+                                        try:
+                                            payload = fast_loads(payload)
+                                        except:
                                             continue
 
-                                    try:
-                                        price_val = update.get("price") or update.get("value") or update.get("current")
-                                        if price_val is not None:
-                                            self.last_price = float(price_val)
-                                            ts_val = update.get("timestamp") or update.get("updated_at") or time.time()
-                                            updated_at = float(ts_val)
-                                            if updated_at < 10000000000: updated_at *= 1000
-                                            self.last_updated_at = updated_at
+                                    updates = payload if isinstance(payload, list) else [payload]
 
-                                            if self.on_update:
-                                                res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "polymarket_ws"})
-                                                if asyncio.iscoroutine(res):
-                                                    asyncio.create_task(res)
-                                    except:
-                                        continue
+                                    for update in updates:
+                                        if not isinstance(update, dict): continue
 
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                break
+                                        sym = str(update.get("symbol") or update.get("pair") or update.get("ticker") or update.get("asset") or "").lower()
+                                        if self.symbol_includes:
+                                            target = self.symbol_includes.lower()
+                                            if target not in sym and not (target == "btc" and "bitcoin" in sym):
+                                                continue
+
+                                        try:
+                                            price_val = update.get("price") or update.get("value") or update.get("current")
+                                            if price_val is not None:
+                                                self.last_price = float(price_val)
+                                                ts_val = update.get("timestamp") or update.get("updated_at") or time.time()
+                                                updated_at = float(ts_val)
+                                                if updated_at < 10000000000: updated_at *= 1000
+                                                self.last_updated_at = updated_at
+                                                self.last_received_at = time.time() * 1000.0
+
+                                                if self.on_update:
+                                                    res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "receivedAt": self.last_received_at, "source": "polymarket_ws"})
+                                                    if asyncio.iscoroutine(res):
+                                                        asyncio.create_task(res)
+                                        except:
+                                            continue
+
+                                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                    break
+                        finally:
+                            ping_task.cancel()
             except Exception as e:
                 print(f"WS Error (Polymarket): {e}")
                 if not self.closed:
                     await asyncio.sleep(2)
 
     def get_last(self):
-        return {"price": self.last_price, "updatedAt": self.last_updated_at, "source": "polymarket_ws"}
+        return {
+            "price": self.last_price,
+            "updatedAt": self.last_updated_at,
+            "receivedAt": getattr(self, "last_received_at", None),
+            "source": "polymarket_ws",
+        }
 
     def close(self):
         self.closed = True
@@ -386,6 +397,13 @@ class PolymarketClobMarketStream:
         new_ids = sorted(list(set(asset_ids)))
         if new_ids != self.asset_ids:
             self.asset_ids = new_ids
+            keep = set(new_ids)
+            for stale_id in list(self.books.keys()):
+                if stale_id not in keep:
+                    self.books.pop(stale_id, None)
+            for stale_id in list(self.book_levels.keys()):
+                if stale_id not in keep:
+                    self.book_levels.pop(stale_id, None)
             if self._ws and not self._ws.closed and self.asset_ids:
                 asyncio.create_task(self._subscribe(self._ws))
 
@@ -424,7 +442,7 @@ class PolymarketClobMarketStream:
 
                         try:
                             while not self.closed:
-                                msg = await ws.receive()
+                                msg = await ws.receive(timeout=30.0)
                                 if msg.type == aiohttp.WSMsgType.TEXT:
                                     data_text = msg.data.strip() if msg.data else ""
                                     if not data_text or data_text in ("PONG", "PING", "OK", "PONG\n"):
@@ -664,7 +682,7 @@ class ChainlinkPriceStream:
                         await ws.send_json(sub_msg)
 
                         while not self.closed:
-                            msg = await ws.receive()
+                            msg = await ws.receive(timeout=30.0)
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data_res = fast_loads(msg.data)
                                 if data_res.get("method") == "eth_subscription":

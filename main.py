@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 import httpx
 
@@ -33,7 +33,7 @@ _ws_clients = set()
 # ── Event-driven early entries & wakeups ───────────────────────────────────────
 MIN_EVAL_INTERVAL_S = 0.25
 CTX_MAX_AGE_S = 4.0
-POLY_WS_MAX_AGE_MS = 2500
+POLY_WS_MAX_AGE_MS = 10000
 MARK_CAPTURE_WINDOW_MS = 20_000
 
 _market_event = asyncio.Event()
@@ -95,16 +95,20 @@ def save_state():
             "last_trade_side": state["last_trade_side"],
             "last_withdrawal": state.get("last_withdrawal"),
         }
-        with open(STATE_PATH, "w") as f:
+        tmp_state = STATE_PATH + ".tmp"
+        with open(tmp_state, "w") as f:
             json.dump(data_to_save, f, indent=2)
+        os.replace(tmp_state, STATE_PATH)
 
         cfg_file = CONFIG_PATH if os.path.exists(CONFIG_PATH) else "config.json"
         if os.path.exists(cfg_file):
             with open(cfg_file, "r") as f:
                 cfg = json.load(f)
             cfg["paper_balance_usd"] = state["paper_balance"]
-            with open(cfg_file, "w") as f:
+            tmp_cfg = cfg_file + ".tmp"
+            with open(tmp_cfg, "w") as f:
                 json.dump(cfg, f, indent=2)
+            os.replace(tmp_cfg, cfg_file)
     except Exception as e:
         print(f"Error saving state: {e}")
 
@@ -217,7 +221,7 @@ async def telegram_poller():
                             await send_telegram_to(chat_id, msg_txt)
                         elif cmd == "/balance":
                             bal = state["paper_balance"]
-                            funder = clob_trader.get_funder() or "N/A"
+                            funder = await asyncio.to_thread(clob_trader.get_funder) or "N/A"
                             await send_telegram_to(chat_id, f"💰 *Current Balance*\n• Balance: `${bal:.2f}`\n• Wallet: `{funder}`")
                         elif cmd == "/help":
                             await send_telegram_to(chat_id, "ℹ️ *Commands*\n/start - Subscribe\n/stop - Unsubscribe\n/status - Bot status\n/balance - Wallet balance")
@@ -325,21 +329,21 @@ def _ps_tol() -> float:
 
 def _ps_live_as_poly_ws(poly_ws: Dict[str, Any]) -> Dict[str, Any]:
     """update_loop: with "prices" on, Polymarket's live Chainlink price from the price socket, in the shape of
-    the old Polymarket feed's last price — while it is fresh: it arrived, and is stamped, within
-    POLY_WS_MAX_AGE_MS. Otherwise poly_ws as it is (the bot then goes on with its other feeds, as before)."""
+    the old Polymarket feed's last price — while it arrived within POLY_WS_MAX_AGE_MS. Uses local receipt time
+    (live_at) for freshness so small PC clock skew (e.g. 2-3s) doesn't falsely reject live PolyBolt ticks."""
     if not _ps_use("prices"):
         return poly_ws
     live = polybolt_feed.live(POLY_WS_MAX_AGE_MS / 1000.0)
     if not live:
         return poly_ws
     behind_ms = (time.time() - live[0]) * 1000.0
-    if behind_ms > POLY_WS_MAX_AGE_MS:
+    if behind_ms > 15000.0:
         if time.time() - _ps_lag_said[0] > 600:
             _ps_lag_said[0] = time.time()
             log_message(f"PRICE STREAM: its live price is stamped {behind_ms / 1000.0:.1f}s behind this computer's clock — "
-                        "not used as the bot's price (the bot keeps its own feed)")
-        return poly_ws
-    return {"price": live[1], "updatedAt": live[0] * 1000.0}
+                        "check PC clock sync (still using received feed while fresh)")
+    recv_ms = (polybolt_feed.live_at or time.time()) * 1000.0
+    return {"price": live[1], "updatedAt": live[0] * 1000.0, "receivedAt": recv_ms}
 
 
 def _ps_strike(start_ms: int, strike_open: Optional[float], strike_source: str):
@@ -537,17 +541,24 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
     # Track whether the book data came from WS or REST
     book_source = "ws" if ((up_ws.get("bids") or up_ws.get("asks")) and (down_ws.get("bids") or down_ws.get("asks"))) else "rest"
 
-    # Smooth out prices with previous valid state to prevent visual glitching if a poll momentarily drops
+    # Smooth out prices with previous valid state ONLY for the same market ID (never across window rollover)
+    mkt_id = str(market.get("id") or "")
+    same_mkt = bool(mkt_id and state.get("last_poly_market_id") == mkt_id)
+    if mkt_id and not same_mkt:
+        state["last_poly_market_id"] = mkt_id
+        state["last_poly_up"] = None
+        state["last_poly_down"] = None
+
     final_up = up_buy if up_buy is not None else gamma_yes
     final_down = down_buy if down_buy is not None else gamma_no
     if final_up is not None:
         state["last_poly_up"] = final_up
-    else:
+    elif same_mkt:
         final_up = state.get("last_poly_up")
 
     if final_down is not None:
         state["last_poly_down"] = final_down
-    else:
+    elif same_mkt:
         final_down = state.get("last_poly_down")
 
     return {
@@ -816,7 +827,7 @@ def _archive(trade: Dict[str, Any]) -> Dict[str, Any]:
 async def update_trades(current_prices: Dict[str, Any]):
     # Snapshot pattern to prevent mid-pass mutations from dropping concurrent trades
     active_snapshot = list(state["active_trades"])
-    remaining_active = []
+    settled_trades = []
     trades_changed = False
     now_ts = time.time()
 
@@ -859,7 +870,6 @@ async def update_trades(current_prices: Dict[str, Any]):
 
         if not expired and not market_closed:
             trade["awaiting_resolution"] = False
-            remaining_active.append(trade)
             continue
 
         outcomes = []
@@ -902,8 +912,7 @@ async def update_trades(current_prices: Dict[str, Any]):
                 trade["expired_at"] = now_ts
             waited = now_ts - trade["expired_at"]
 
-            if not _pt and waited < settings.AUTHORITATIVE_SETTLE_WAIT_S and not market_closed:
-                remaining_active.append(trade)
+            if not _pt and waited < settings.AUTHORITATIVE_SETTLE_WAIT_S:
                 continue
 
             if _pt:
@@ -923,10 +932,8 @@ async def update_trades(current_prices: Dict[str, Any]):
             first_seen = trade.get("unresolved_since")
             if first_seen is None:
                 trade["unresolved_since"] = now_ts
-                remaining_active.append(trade)
                 continue
             if now_ts - first_seen < SETTLEMENT_GRACE_SECONDS:
-                remaining_active.append(trade)
                 continue
             trade["status"] = "VOID"
             trade["exit_reason"] = "void"
@@ -935,6 +942,7 @@ async def update_trades(current_prices: Dict[str, Any]):
             if trade.get("mode", "paper") == "paper":
                 state["paper_balance"] += trade["amount"]
             state["trade_history"].append(_archive(trade))
+            settled_trades.append(trade)
             trades_changed = True
             log_message(f"VOID: Trade for {trade['market_slug']} unresolved past grace; stake refunded (paper).")
             continue
@@ -975,9 +983,12 @@ async def update_trades(current_prices: Dict[str, Any]):
         trade["settlement_price_at_expiry"] = trade.get("settlement_price_at_expiry") or settlement_price
         trade["winning_outcome"] = outcomes[winning_index] if 0 <= winning_index < len(outcomes) else None
         state["trade_history"].append(_archive(trade))
+        settled_trades.append(trade)
         trades_changed = True
 
-    state["active_trades"] = remaining_active
+    if settled_trades:
+        settled_ids = {id(t) for t in settled_trades}
+        state["active_trades"] = [t for t in state["active_trades"] if id(t) not in settled_ids]
     if trades_changed:
         save_state()
 
@@ -988,7 +999,12 @@ async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
         return
     if state["trading_mode"] != "live":
         return
-    if not settings.WITHDRAW_ADDRESS or settings.WITHDRAW_AMOUNT <= 0:
+    raw_dest = (settings.WITHDRAW_ADDRESS or "").strip()
+    if raw_dest.startswith("0x") and len(raw_dest) == 42:
+        dest_address = raw_dest
+    else:
+        dest_address = clob_trader.get_eoa_address() if clob_trader else None
+    if not dest_address or settings.WITHDRAW_AMOUNT <= 0:
         return
 
     now_ts = time.time()
@@ -1002,19 +1018,19 @@ async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
                 state["withdraw_submitted_at"] = now_ts
                 state["withdraw_locked_market"] = poly_snapshot.get("market", {}).get("id") if poly_snapshot.get("ok") else None
                 
-                res = await asyncio.to_thread(clob_trader.withdraw_pusd, settings.WITHDRAW_ADDRESS, settings.WITHDRAW_AMOUNT)
+                res = await asyncio.to_thread(clob_trader.withdraw_pusd, dest_address, settings.WITHDRAW_AMOUNT)
                 if res.get("ok"):
                     tx = res.get("tx")
                     state["last_withdrawal"] = {
                         "amount": settings.WITHDRAW_AMOUNT,
-                        "recipient": settings.WITHDRAW_ADDRESS,
+                        "recipient": dest_address,
                         "timestamp": datetime.now().isoformat(),
                         "tx": tx,
                         "status": "submitted"
                     }
                     save_state()
                     log_message(f"CAPITAL EXTRACTOR: Withdrawal tx submitted ({tx}). Waiting confirmation...")
-                    await send_telegram(f"💸 *Capital Extractor*\nWithdrew `${settings.WITHDRAW_AMOUNT:.2f}` pUSD to `{settings.WITHDRAW_ADDRESS}`\nTx: `{tx}`")
+                    await send_telegram(f"💸 *Capital Extractor*\nWithdrew `${settings.WITHDRAW_AMOUNT:.2f}` pUSD to `{dest_address}`\nTx: `{tx}`")
                 else:
                     log_message(f"CAPITAL EXTRACTOR FAILED: {res.get('error')}")
                     state["withdraw_state"] = "cooldown"
@@ -1037,13 +1053,19 @@ async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
     elif st == "cooldown":
         resume_after = (settings.WITHDRAW_RESUME_AFTER or "flat").lower()
         if not settings.WITHDRAW_AUTO_RESUME:
+            if state.get("running"):
+                state["running"] = False
+                _reflect_running_now()
+                log_message("CAPITAL EXTRACTOR: Auto-resume is OFF — trading paused after withdrawal.")
             return
 
         can_resume = False
         sub_at = state.get("withdraw_submitted_at") or now_ts
-        if resume_after == "flat":
+        if resume_after in ("flat", "confirmed"):
             if now_ts - sub_at > 30:
                 can_resume = True
+        elif resume_after == "submitted":
+            can_resume = True
         elif resume_after == "next_window":
             cur_mkt_id = poly_snapshot.get("market", {}).get("id") if poly_snapshot.get("ok") else None
             if cur_mkt_id and cur_mkt_id != state.get("withdraw_locked_market"):
@@ -1061,7 +1083,7 @@ async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
 def entry_block_reason(ctx: Dict[str, Any]) -> Optional[str]:
     if not state["running"]:
         return "stopped"
-    if state["withdraw_state"] == "in_progress":
+    if state["withdraw_state"] == "in_progress" or (state["withdraw_state"] == "cooldown" and not settings.WITHDRAW_AUTO_RESUME):
         return "withdraw_in_progress"
     if not ctx:
         return "no_context"
@@ -1211,7 +1233,7 @@ async def update_loop():
             current_price = None
             price_source = None
             price_is_fresh = True
-            poly_updated = poly_ws.get("updatedAt") or 0
+            poly_updated = poly_ws.get("receivedAt") or poly_ws.get("updatedAt") or 0
             if poly_ws.get("price"):
                 current_price = poly_ws["price"]
                 price_source = "Polymarket WS"
@@ -1367,16 +1389,18 @@ async def update_loop():
             current_prices_dict = {"spot": spot_price, "chainlink": current_price}
 
             exec_result = None
-            if poly_snapshot["ok"] and state["running"] and state["withdraw_state"] != "in_progress":
-                flipped = await maybe_flip_position(decision, poly_snapshot, time_left_min)
-                exec_result = await execute_trade(
-                    decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open,
-                    poly_snapshot.get("token_ids", {}), poly_snapshot.get("orderbook", {}),
-                    strike_source=strike_source, window_start_ms=start_ms,
-                    open_reason="flip_entry" if flipped else "ev_entry")
+            withdraw_paused = state["withdraw_state"] == "in_progress" or (state["withdraw_state"] == "cooldown" and not settings.WITHDRAW_AUTO_RESUME)
+            if poly_snapshot["ok"] and state["running"] and not withdraw_paused:
+                async with _entry_lock:
+                    flipped = await maybe_flip_position(decision, poly_snapshot, time_left_min)
+                    exec_result = await execute_trade(
+                        decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open,
+                        poly_snapshot.get("token_ids", {}), poly_snapshot.get("orderbook", {}),
+                        strike_source=strike_source, window_start_ms=start_ms,
+                        open_reason="flip_entry" if flipped else "ev_entry")
             elif not state["running"]:
                 exec_result = "stopped"
-            elif state["withdraw_state"] == "in_progress":
+            elif withdraw_paused:
                 exec_result = "withdraw_in_progress"
 
             # Check if event executor fired
@@ -1589,13 +1613,19 @@ async def list_files():
     out = []
     for key, (path, _) in DOWNLOADABLE.items():
         exists = os.path.exists(path)
+        row_cnt = None
+        if exists and path.endswith(".csv"):
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as _f:
+                    row_cnt = max(0, sum(1 for _ in _f) - 1)
+            except Exception:
+                row_cnt = None
         out.append({
             "key": key,
             "name": os.path.basename(path),
             "exists": exists,
             "size": os.path.getsize(path) if exists else 0,
-            "rows": (max(0, sum(1 for _ in open(path, encoding="utf-8", errors="ignore")) - 1)
-                     if exists and path.endswith(".csv") else None),
+            "rows": row_cnt,
             "modified": (datetime.fromtimestamp(os.path.getmtime(path)).isoformat()
                          if exists else None),
         })
@@ -1611,7 +1641,27 @@ async def download_file(key: str):
         return JSONResponse({"error": "not_generated_yet", "path": path}, status_code=404)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base, ext = os.path.splitext(os.path.basename(path))
-    return FileResponse(path, media_type=media, filename=f"15m-{base}-{stamp}{ext}")
+    dl_name = f"15m-{base}-{stamp}{ext}"
+    snapshot_size = os.path.getsize(path)
+
+    def _iter_snapshot():
+        remaining = snapshot_size
+        with open(path, "rb") as f:
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(
+        _iter_snapshot(),
+        media_type=media,
+        headers={
+            "Content-Disposition": f'attachment; filename="{dl_name}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 def _reflect_running_now():
     ts = state["latest_data"].get("trading_state")
@@ -1713,7 +1763,31 @@ async def post_settings(new_settings: Dict[str, Any]):
             settings.PRIVATE_KEY = normalize_private_key(new_pk)
             new_settings["private_key"] = settings.PRIVATE_KEY
         except Exception as e:
-            return {"status": "error", "error": f"invalid_private_key: {e}"}
+            return JSONResponse({"status": "error", "error": f"invalid_private_key: {e}"}, status_code=400)
+
+    # Unmask secrets BEFORE merging and writing config.json so masked placeholders never corrupt disk
+    if isinstance(new_settings.get("live"), dict):
+        lv_in = new_settings["live"]
+        rk = lv_in.get("relayer_api_key")
+        if rk and "..." not in str(rk):
+            settings.RELAYER_API_KEY = str(rk).strip()
+            lv_in["relayer_api_key"] = settings.RELAYER_API_KEY
+            new_settings.setdefault("relayer", {})["api_key"] = settings.RELAYER_API_KEY
+        elif rk:
+            lv_in["relayer_api_key"] = settings.RELAYER_API_KEY
+        ak = lv_in.get("alchemy_api_key")
+        if ak and "..." not in str(ak):
+            settings.ALCHEMY_API_KEY = str(ak).strip()
+            lv_in["alchemy_api_key"] = settings.ALCHEMY_API_KEY
+            new_settings.setdefault("chainlink", {})["alchemy_api_key"] = settings.ALCHEMY_API_KEY
+        elif ak:
+            lv_in["alchemy_api_key"] = settings.ALCHEMY_API_KEY
+
+    if isinstance(new_settings.get("telegram"), dict):
+        tg_in = new_settings["telegram"]
+        tg_tok = tg_in.get("bot_token")
+        if tg_tok and "..." in str(tg_tok):
+            tg_in["bot_token"] = settings.TELEGRAM_BOT_TOKEN
 
     cfg_file = CONFIG_PATH if os.path.exists(CONFIG_PATH) else "config.json"
     existing_cfg = {}
@@ -1732,9 +1806,12 @@ async def post_settings(new_settings: Dict[str, Any]):
                 base[k] = v
         return base
 
+    old_paper_cfg = settings.PAPER_BALANCE_USD
     merged_cfg = deep_merge(existing_cfg, new_settings)
-    with open(CONFIG_PATH, "w") as f:
+    tmp_cfg = CONFIG_PATH + ".tmp"
+    with open(tmp_cfg, "w") as f:
         json.dump(merged_cfg, f, indent=2)
+    os.replace(tmp_cfg, CONFIG_PATH)
 
     settings.MODE = new_settings.get("mode", settings.MODE)
     settings.PAPER_BALANCE_USD = float(new_settings.get("paper_balance_usd", settings.PAPER_BALANCE_USD))
@@ -1823,7 +1900,8 @@ async def post_settings(new_settings: Dict[str, Any]):
         polybolt_feed.wake()                                         # wake immediately if key or price_stream changed
 
     state["trading_mode"] = settings.MODE
-    state["paper_balance"] = settings.PAPER_BALANCE_USD
+    if "paper_balance_usd" in new_settings and abs(settings.PAPER_BALANCE_USD - old_paper_cfg) > 1e-9:
+        state["paper_balance"] = settings.PAPER_BALANCE_USD
 
     if settings.SYMBOL != old_symbol:
         basis_tracker.reset()
